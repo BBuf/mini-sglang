@@ -40,6 +40,12 @@ class Engine:
         self.dtype = config.dtype
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
+        if config.model_config.is_fp8:
+            try:
+                from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+                set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+            except Exception:
+                pass
 
         self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
@@ -143,7 +149,10 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            return {
+                k: (v if (v.dtype == torch.float8_e4m3fn or "_scale_inv" in k or "e_score_correction_bias" in k) else v.to(self.dtype))
+                for k, v in load_weight(config.model_path, self.device)
+            }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]

@@ -32,10 +32,26 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    # ---- MLA / DeepSeek-style MoE extras (0 / defaults for non-MLA models) ----
+    q_lora_rank: int = 0
+    kv_lora_rank: int = 0
+    qk_nope_head_dim: int = 0
+    qk_rope_head_dim: int = 0
+    v_head_dim: int = 0
+    n_shared_experts: int = 0
+    first_k_dense_replace: int = 0
+    routed_scaling_factor: float = 1.0
+    n_group: int = 1
+    topk_group: int = 1
+    is_fp8: bool = False
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
+
+    @property
+    def is_mla(self) -> bool:
+        return self.kv_lora_rank > 0
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
@@ -56,9 +72,38 @@ class ModelConfig:
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
-        # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
-        rope_scaling = getattr(config, "rope_scaling", None)
-        rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
+        # MLA / DeepSeek-MoE extras
+        q_lora_rank = getattr(config, "q_lora_rank", 0) or 0
+        kv_lora_rank = getattr(config, "kv_lora_rank", 0) or 0
+        qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0) or 0
+        qk_rope_head_dim = getattr(config, "qk_rope_head_dim", 0) or 0
+        v_head_dim = getattr(config, "v_head_dim", 0) or 0
+        n_shared_experts = getattr(config, "n_shared_experts", 0) or 0
+        first_k_dense_replace = getattr(config, "first_k_dense_replace", 0) or 0
+        routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0) or 1.0
+        n_group = getattr(config, "n_group", 1) or 1
+        topk_group = getattr(config, "topk_group", 1) or 1
+
+        qc = getattr(config, "quantization_config", None)
+        if isinstance(qc, dict):
+            is_fp8 = qc.get("quant_method") == "fp8"
+        else:
+            is_fp8 = getattr(qc, "quant_method", None) == "fp8"
+
+        if kv_lora_rank > 0:  # MLA (e.g. glm_moe_dsa / deepseek): use materialized head dim
+            num_experts = getattr(config, "n_routed_experts", num_experts)
+            # NOTE: in GlmMoeDsaConfig `head_dim` is an alias for `qk_rope_head_dim`, so the
+            # raw qk_rope attribute is unreliable. Derive it from qk_head_dim - qk_nope.
+            qk_head_dim = getattr(config, "qk_head_dim", 0) or (qk_nope_head_dim + qk_rope_head_dim)
+            qk_rope_head_dim = qk_head_dim - qk_nope_head_dim
+            head_dim = qk_head_dim
+            num_kv_heads = config.num_attention_heads
+            rope_params = getattr(config, "rope_parameters", None) or {}
+            rope_theta = rope_params.get("rope_theta", None) or getattr(config, "rope_theta", 10000.0)
+            rope_scaling = None
+        else:
+            rope_scaling = getattr(config, "rope_scaling", None)
+            rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -84,4 +129,15 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            n_shared_experts=n_shared_experts,
+            first_k_dense_replace=first_k_dense_replace,
+            routed_scaling_factor=routed_scaling_factor,
+            n_group=n_group,
+            topk_group=topk_group,
+            is_fp8=is_fp8,
         )
