@@ -66,6 +66,7 @@ class Engine:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            attention_backend=config.attention_backend,
         )
 
         # ======================= Page table initialization ========================
@@ -156,14 +157,25 @@ class Engine:
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
-        cache_per_page = (
-            2  # key + value
-            * config.model_config.head_dim
-            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
-            * config.page_size
-            * self.dtype.itemsize
-            * config.model_config.num_layers
-        )
+        if config.model_config.is_mla and config.attention_backend == "mla":
+            # Absorbed-MLA latent pool: ckv(kv_lora_rank) + k_pe(qk_rope_head_dim) per
+            # token per layer, replicated across TP (no head dim, no separate k/v). The
+            # MHA formula would overcount by ~num_heads and starve the KV cache.
+            cache_per_page = (
+                (config.model_config.kv_lora_rank + config.model_config.qk_rope_head_dim)
+                * config.page_size
+                * self.dtype.itemsize
+                * config.model_config.num_layers
+            )
+        else:
+            cache_per_page = (
+                2  # key + value
+                * config.model_config.head_dim
+                * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
+                * config.page_size
+                * self.dtype.itemsize
+                * config.model_config.num_layers
+            )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory

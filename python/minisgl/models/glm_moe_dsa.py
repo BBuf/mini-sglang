@@ -123,7 +123,7 @@ def _gated_mlp(config, intermediate_size):
 
 
 # --------------------------------------------------------------------------- #
-# Attention (MLA, non-absorbed)
+# Attention (MLA: absorbed when the backend supports it, else naive materialized K/V)
 # --------------------------------------------------------------------------- #
 class GlmMLAAttention(BaseOP):
     def __init__(self, config: ModelConfig, layer_id: int):
@@ -149,6 +149,8 @@ class GlmMLAAttention(BaseOP):
         self.kv_b_proj = _col(config, self.kv_lora_rank, num_heads * (self.qk_nope_head_dim + self.v_head_dim))
 
         self.o_proj = _orow(config, num_heads * self.v_head_dim, config.hidden_size)
+        self.w_kc = None  # absorbed W_UK [H,qk_nope,kv_lora], built lazily on first forward
+        self.w_vc = None  # absorbed W_UV^T [H,kv_lora,v_head]
 
     def _apply_rope(self, q_pe, k_pe, positions):
         d = self.qk_rope_head_dim
@@ -164,32 +166,59 @@ class GlmMLAAttention(BaseOP):
         k_out = kf * cos + _rotate_gptj(kf) * sin
         return q_out.to(q_pe.dtype), k_out.to(k_pe.dtype)
 
+    def _build_absorb_weights(self) -> None:
+        # Split kv_b_proj per head into W_UK (absorbed into q) and W_UV (absorbed into o)
+        # so attention runs directly in the kv_lora latent space (sglang-style absorbed MLA).
+        # kv_b_proj is bf16 here (only the routed experts stay fp8), so no dequant is needed.
+        W = self.kv_b_proj.weight.view(
+            self.local_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+        )
+        self.w_kc = W[:, : self.qk_nope_head_dim, :].contiguous()                  # [H,nope,lora]
+        self.w_vc = W[:, self.qk_nope_head_dim :, :].transpose(1, 2).contiguous()  # [H,lora,vhead]
+
     @nvtx_annotate("MLA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         positions = ctx.batch.positions
         T = x.shape[0]
+        backend = ctx.attn_backend
 
         q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
         q = q.view(T, self.local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        ckv = self.kv_a_proj_with_mqa.forward(x)
-        k_compressed, k_pe = ckv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        ckv_all = self.kv_a_proj_with_mqa.forward(x)
+        k_compressed, k_pe = ckv_all.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_compressed = self.kv_a_layernorm.forward(k_compressed.contiguous())
+
+        k_pe = k_pe.reshape(T, 1, self.qk_rope_head_dim)
+        q_pe, k_pe = self._apply_rope(q_pe, k_pe, positions)  # q_pe [T,H,rope], k_pe [T,1,rope]
+
+        if hasattr(backend, "forward_mla"):
+            # ---- absorbed MLA: attention in the kv_lora latent space ----
+            if self.w_kc is None:
+                self._build_absorb_weights()
+            q_nope_latent = torch.einsum("thn,hnl->thl", q_nope.to(self.w_kc.dtype), self.w_kc)
+            o_latent = backend.forward_mla(
+                q_nope_latent.contiguous(),
+                q_pe.contiguous(),
+                k_compressed,
+                k_pe.squeeze(1).contiguous(),
+                self.layer_id,
+                ctx.batch,
+            )  # [T,H,kv_lora]
+            o = torch.einsum("thl,hlv->thv", o_latent.to(self.w_vc.dtype), self.w_vc)  # [T,H,vhead]
+            return self.o_proj.forward(o.reshape(T, self.local_heads * self.v_head_dim))
+
+        # ---- naive MLA: materialize per-head K/V ----
         kv = self.kv_b_proj.forward(k_compressed)
         kv = kv.view(T, self.local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
-        k_pe = k_pe.reshape(T, 1, self.qk_rope_head_dim)
-        q_pe, k_pe = self._apply_rope(q_pe, k_pe, positions)
-        k_pe = k_pe.expand(T, self.local_heads, self.qk_rope_head_dim)
-
+        k_pe_h = k_pe.expand(T, self.local_heads, self.qk_rope_head_dim)
         q = torch.cat([q_nope, q_pe], dim=-1).contiguous()
-        k = torch.cat([k_nope, k_pe], dim=-1).reshape(T, self.local_heads * self.qk_head_dim).contiguous()
+        k = torch.cat([k_nope, k_pe_h], dim=-1).reshape(T, self.local_heads * self.qk_head_dim).contiguous()
         v = v.reshape(T, self.local_heads * self.v_head_dim).contiguous()
-
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        o = backend.forward(q, k, v, self.layer_id, ctx.batch)
         o = o.reshape(T, self.local_heads * self.v_head_dim)
         return self.o_proj.forward(o)
 
