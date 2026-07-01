@@ -43,6 +43,18 @@ def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
+def _rope_cos_sin(positions: torch.Tensor, dim: int, base: float):
+    # Compute GPT-J interleaved RoPE cos/sin ONCE per forward. positions are identical
+    # across all layers, so this is shared instead of recomputed 78x (a big kernel-count
+    # cut at bs=1, where the model is dominated by many tiny sequential kernels).
+    # Returns cos, sin as [T, 1, dim], ready to broadcast over heads.
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=positions.device) / dim))
+    freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
+    cos = freqs.cos().repeat_interleave(2, dim=-1)[:, None, :]
+    sin = freqs.sin().repeat_interleave(2, dim=-1)[:, None, :]
+    return cos, sin
+
+
 # --------------------------------------------------------------------------- #
 # Block-FP8 linears (reuse sglang's triton w8a8 block kernel for sglang parity)
 # --------------------------------------------------------------------------- #
@@ -152,14 +164,9 @@ class GlmMLAAttention(BaseOP):
         self.w_kc = None  # absorbed W_UK [H,qk_nope,kv_lora], built lazily on first forward
         self.w_vc = None  # absorbed W_UV^T [H,kv_lora,v_head]
 
-    def _apply_rope(self, q_pe, k_pe, positions):
-        d = self.qk_rope_head_dim
-        inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, d, 2, dtype=torch.float32, device=q_pe.device) / d))
-        freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
+    def _apply_rope(self, q_pe, k_pe, cos, sin):
         # GLM-5.2 uses INTERLEAVED (GPT-J) RoPE (config rope_interleave=true ->
-        # sglang is_neox_style=False). Verified bit-exact vs sglang get_rope.
-        cos = freqs.cos().repeat_interleave(2, dim=-1)[:, None, :]
-        sin = freqs.sin().repeat_interleave(2, dim=-1)[:, None, :]
+        # sglang is_neox_style=False). cos/sin are precomputed once per forward.
         qf = q_pe.to(torch.float32)
         kf = k_pe.to(torch.float32)
         q_out = qf * cos + _rotate_gptj(qf) * sin
@@ -177,9 +184,8 @@ class GlmMLAAttention(BaseOP):
         self.w_vc = W[:, self.qk_nope_head_dim :, :].transpose(1, 2).contiguous()  # [H,lora,vhead]
 
     @nvtx_annotate("MLA")
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
-        positions = ctx.batch.positions
         T = x.shape[0]
         backend = ctx.attn_backend
 
@@ -192,7 +198,7 @@ class GlmMLAAttention(BaseOP):
         k_compressed = self.kv_a_layernorm.forward(k_compressed.contiguous())
 
         k_pe = k_pe.reshape(T, 1, self.qk_rope_head_dim)
-        q_pe, k_pe = self._apply_rope(q_pe, k_pe, positions)  # q_pe [T,H,rope], k_pe [T,1,rope]
+        q_pe, k_pe = self._apply_rope(q_pe, k_pe, cos, sin)  # q_pe [T,H,rope], k_pe [T,1,rope]
 
         if hasattr(backend, "forward_mla"):
             # ---- absorbed MLA: attention in the kv_lora latent space ----
@@ -347,9 +353,9 @@ class GlmMoeDsaDecoderLayer(BaseOP):
         self._layer_id = layer_id
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
-    def forward(self, x, residual=None):
+    def forward(self, x, cos, sin, residual=None):
         x, residual = self.input_layernorm.forward(x, residual)
-        x = self.self_attn.forward(x)
+        x = self.self_attn.forward(x, cos, sin)
         x, residual = self.post_attention_layernorm.forward(x, residual)
         x = self.mlp.forward(x)
         return x, residual
@@ -362,12 +368,16 @@ class GlmMoeDsaModel(BaseOP):
             [GlmMoeDsaDecoderLayer(config, i) for i in range(config.num_layers)]
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+        self._rope_dim = config.qk_rope_head_dim
+        self._rope_base = float(config.rotary_config.base)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
+        # RoPE cos/sin computed ONCE per forward, shared across all layers.
+        cos, sin = _rope_cos_sin(get_global_ctx().batch.positions, self._rope_dim, self._rope_base)
         residual = None
         for layer in self.layers.op_list:
-            x, residual = layer.forward(x, residual)
+            x, residual = layer.forward(x, cos, sin, residual)
         return self.norm.forward(x, residual)[0]
 
 
