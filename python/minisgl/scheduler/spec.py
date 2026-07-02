@@ -310,11 +310,16 @@ class SpecManager:
 
         self._rounds += 1
         self._accepted += n_new
-        if self._log_stats and self._rounds % 50 == 0:
-            logger.info_rank0(
-                f"[spec] rounds={self._rounds} "
-                f"mean_accept={self._accepted / self._rounds:.2f}"
-            )
+        if self._log_stats:
+            if not hasattr(self, "_n_hist"):
+                self._n_hist = [0] * (self.k + 2)
+            self._n_hist[n_new] += 1
+            if self._rounds % 200 == 0:
+                logger.info_rank0(
+                    f"[spec] rounds={self._rounds} "
+                    f"mean_accept={self._accepted / self._rounds:.2f} "
+                    f"hist={self._n_hist}"
+                )
 
     # ------------------------------------------------------------- cleanup ----
     def _free_tail(self, req: Req, alloc_len: int) -> None:

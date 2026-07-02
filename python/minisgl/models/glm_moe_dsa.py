@@ -352,6 +352,10 @@ _trtllm_moe_ok = None
 _IN_MTP = False
 
 
+def _use_moe_glue() -> bool:
+    return os.environ.get("MINISGL_MOE_GLUE", "1") == "1"
+
+
 def _use_custom_moe() -> bool:
     mode = os.environ.get("MINISGL_CUSTOM_MOE", "mtp")
     if mode == "1":
@@ -692,6 +696,23 @@ class GlmSparseMoE(BaseOP):
                     f"[xcheck] M={num_tokens} rel={rel.item():.3e} "
                     f"|mine|={routed.float().abs().max().item():.3e} |ref|={ref.float().abs().max().item():.3e}"
                 )
+        elif self.is_fp8 and _use_moe_glue() and not _IN_MTP and num_tokens <= 16:
+            from minisgl.kernel.moe_glue import fused_experts_fp8_decode
+
+            topk_ids, topk_w = self._route(router_logits)
+            out = fused_experts_fp8_decode(
+                x.contiguous(),
+                self.experts.gate_up_proj,
+                self.experts.gate_up_proj_scale_inv,
+                self.experts.down_proj,
+                self.experts.down_proj_scale_inv,
+                topk_w,
+                topk_ids,
+                shared,
+            )
+            if self._tp > 1:
+                out = self._comm.all_reduce(out)
+            return out.view(num_tokens, hidden_dim)
         elif self.is_fp8:
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts_impl
 
