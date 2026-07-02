@@ -59,9 +59,17 @@ class MLAKVCache(BaseKVCachePool):
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
-        # k == ckv [T, kv_lora_rank], v == k_pe [T, qk_rope_head_dim]; page_size==1 scatter
-        self._ckv_buffer[layer_id].view(self._ckv_flat)[out_loc] = k
-        self._kpe_buffer[layer_id].view(self._kpe_flat)[out_loc] = v
+        from minisgl.kernel import store_mla_cache
+
+        # k == ckv [T, kv_lora_rank], v == k_pe [T, qk_rope_head_dim]; page_size==1
+        # scatter of both rows in ONE kernel (vs two index_put_ kernels).
+        store_mla_cache(
+            self._ckv_buffer[layer_id].view(self._ckv_flat),
+            self._kpe_buffer[layer_id].view(self._kpe_flat),
+            out_loc,
+            k,
+            v,
+        )
 
     @property
     def device(self) -> torch.device:
