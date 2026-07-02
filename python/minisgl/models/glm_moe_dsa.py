@@ -297,7 +297,12 @@ class GlmMoeGate(BaseOP):
         self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x.to(torch.float32), self.weight.to(torch.float32))
+        if self.weight.dtype != torch.float32:
+            # Cast once at first forward and keep fp32 (the loader's dtype assert
+            # forces the declared param to match the bf16 checkpoint). Re-casting
+            # the [E, hidden] weight every call costs ~7us/layer at bs=1.
+            self.weight = self.weight.to(torch.float32)
+        return F.linear(x.to(torch.float32), self.weight)
 
 
 class Fp8Experts(BaseOP):
