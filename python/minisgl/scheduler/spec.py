@@ -48,15 +48,23 @@ class SpecManager:
     """
 
     def __init__(self, sched: Scheduler, steps: int):
+        import os
+
         self.s = sched
         self.k = steps
         self.engine = sched.engine
         self.device = sched.device
         self.states: Dict[int, _SpecState] = {}
+        self._log_stats = os.environ.get("MINISGL_SPEC_LOG", "0") == "1"
         self._rounds = 0
         self._accepted = 0
         self._t_verify = 0.0
         self._t_draft = 0.0
+        # drafts are copied to pinned host memory as they are produced, so the
+        # verify round reads them without a blocking .cpu()
+        self._drafts_gpu = torch.empty(steps, dtype=torch.int32, device=self.device)
+        self._drafts_pin = torch.empty(steps, dtype=torch.int32, pin_memory=True)
+        self._drafts_event = torch.cuda.Event()
 
     # ------------------------------------------------------------- helpers ----
     @property
@@ -146,15 +154,19 @@ class SpecManager:
         next_pos+i-1, consumes emb(d_i) (== the token at its position+1) plus the
         previous MTP hidden, and its argmax d_{i+1} lands at token position+2."""
         table = req.table_idx
+        self._drafts_gpu[0] = prev_draft[0]
         for i in range(1, self.k):
             pos = next_pos + i - 1
             positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
-            b, _, _ = self._make_batch(req, [(pos, pos + 1)], positions, "decode", False)
+            b, _, _ = self._make_batch(req, [(pos, pos + 1)], positions, "decode", True)
             b.spec_prev_hidden = prev_hidden
             logits, mtp_hidden = self.engine.forward_mtp_batch(b, prev_draft)
             prev_draft = torch.argmax(logits[:1], dim=-1).to(torch.int32)
             prev_hidden = mtp_hidden[:1]
             self._token_pool[table, pos + 2] = prev_draft[0]
+            self._drafts_gpu[i] = prev_draft[0]
+        self._drafts_pin.copy_(self._drafts_gpu, non_blocking=True)
+        self._drafts_event.record()
 
     # ---------------------------------------------------------------- round ----
     def pick_req(self) -> Optional[Req]:
@@ -179,7 +191,8 @@ class SpecManager:
         self._ensure_pages(req, D + 2 * k + 1)
 
         # ---- verify: k+1 staggered rows through the normal (graphed) decode path
-        drafts_cpu = self._token_pool[table, D : D + k].cpu()
+        self._drafts_event.synchronize()
+        drafts_cpu = self._drafts_pin
         rows = [(D - 1 + i, D + i) for i in range(k + 1)]
         positions = torch.arange(D - 1, D + k, dtype=torch.int32, device=self.device)
         batch, tbl, out_pos = self._make_batch(req, rows, positions, "decode", True)
@@ -236,8 +249,8 @@ class SpecManager:
         m = n_new  # rows D-1 .. D-1+m-1 consume tokens D..D+m-1 and hidden rows 0..m-1
         positions = torch.arange(D - 1, D - 1 + m, dtype=torch.int32, device=self.device)
         rows = [(D - 1 + i, D + i) for i in range(m)]
-        mtp_batch, tbl, out_pos = self._make_batch(req, rows, positions, "decode", False)
-        mtp_batch.spec_prev_hidden = hidden[:m]
+        mtp_batch, tbl, out_pos = self._make_batch(req, rows, positions, "decode", True)
+        mtp_batch.spec_prev_hidden = hidden[: mtp_batch.padded_size]
         input_ids = self._token_pool[(tbl, out_pos + 1)]
         logits, mtp_hidden = self.engine.forward_mtp_batch(mtp_batch, input_ids)
         d = torch.argmax(logits[m - 1 : m], dim=-1).to(torch.int32)
@@ -245,18 +258,19 @@ class SpecManager:
         self._token_pool[table, J + 2] = d[0]
         self._chain_drafts(req, next_pos=J + 1, prev_draft=d, prev_hidden=mtp_hidden[m - 1 : m])
 
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
         self._rounds += 1
         self._accepted += n_new
-        self._t_verify += t1 - t0
-        self._t_draft += t2 - t1
-        if self._rounds % 50 == 0:
-            logger.info_rank0(
-                f"[spec] rounds={self._rounds} mean_accept={self._accepted / self._rounds:.2f} "
-                f"verify={1e3 * self._t_verify / self._rounds:.2f}ms "
-                f"draft={1e3 * self._t_draft / self._rounds:.2f}ms"
-            )
+        if self._log_stats:
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            self._t_verify += t1 - t0
+            self._t_draft += t2 - t1
+            if self._rounds % 50 == 0:
+                logger.info_rank0(
+                    f"[spec] rounds={self._rounds} mean_accept={self._accepted / self._rounds:.2f} "
+                    f"verify={1e3 * self._t_verify / self._rounds:.2f}ms "
+                    f"draft={1e3 * self._t_draft / self._rounds:.2f}ms"
+                )
 
     # ------------------------------------------------------------- cleanup ----
     def finish_req(self, req: Req) -> None:

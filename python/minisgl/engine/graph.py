@@ -151,6 +151,66 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
+        self._capture_mtp_graphs(model, pool)
+
+    def _capture_mtp_graphs(self, model: BaseLLMModel, pool) -> None:
+        # Speculative-decoding draft graphs: the MTP layer runs as tiny decode-shaped
+        # batches (extend over accepted rows / chained q=1 steps). Capture them so
+        # draft refill is not eager-launch bound.
+        import os
+
+        self.mtp_graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        spec_steps = int(os.environ.get("MINISGL_SPEC_STEPS", "0"))
+        if spec_steps <= 0 or not hasattr(model, "forward_mtp"):
+            return
+        mtp = getattr(getattr(model, "model", None), "mtp", None)
+        if mtp is None:
+            return
+        bs_list = [bs for bs in self.graph_bs_list if bs <= spec_steps + 1]
+        if not bs_list:
+            return
+        max_bs = max(bs_list)
+        dev = self.device
+        # probe hidden size/dtype from the captured main hidden buffer
+        any_hidden = next(iter(self.hidden_map.values()))
+        H, hdtype = any_hidden.shape[-1], any_hidden.dtype
+        vocab = self.buffer.logits.shape[1]
+        self.mtp_buffer = GraphCaptureBuffer(
+            input_ids=torch.zeros(max_bs, dtype=torch.int32, device=dev),
+            out_loc=torch.zeros(max_bs, dtype=torch.int32, device=dev),
+            positions=torch.zeros(max_bs, dtype=torch.int32, device=dev),
+            logits=torch.empty(max_bs, vocab, dtype=torch.float32, device=dev),
+        )
+        self.mtp_hidden_in = torch.zeros(max_bs, H, dtype=hdtype, device=dev)
+        self.mtp_hidden_out = torch.empty(max_bs, H, dtype=hdtype, device=dev)
+        logger.info_rank0(f"Capturing MTP draft graphs with sizes: {bs_list}")
+        for bs in sorted(bs_list, reverse=True):
+            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch.padded_reqs = batch.reqs
+            self.attn_backend.prepare_metadata(batch)
+            self.attn_backend.prepare_for_replay(batch)
+            self.mtp_buffer.set_batch(batch)
+            batch.spec_prev_hidden = self.mtp_hidden_in[:bs]
+            graph = torch.cuda.CUDAGraph()
+            with get_global_ctx().forward_batch(batch):
+                logits, hidden = model.forward_mtp()
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    logits, hidden = model.forward_mtp()
+                    self.mtp_buffer.logits[:bs] = logits
+                    self.mtp_hidden_out[:bs] = hidden
+            self.mtp_graph_map[bs] = graph
+
+    def replay_mtp(self, batch: Batch, input_ids: torch.Tensor):
+        bs = batch.padded_size
+        buf = self.mtp_buffer
+        buf.input_ids[:bs] = input_ids
+        buf.positions[:bs] = batch.positions
+        buf.out_loc[:bs] = batch.out_loc
+        self.mtp_hidden_in[:bs] = batch.spec_prev_hidden[:bs]
+        self.attn_backend.prepare_for_replay(batch)
+        self.mtp_graph_map[bs].replay()
+        return buf.logits[: batch.size], self.mtp_hidden_out[: batch.size]
+
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
 

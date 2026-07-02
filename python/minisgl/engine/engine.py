@@ -237,8 +237,11 @@ class Engine:
     def forward_mtp_batch(
         self, batch: Batch, input_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run only the MTP / NextN draft layer (eager). Returns (logits, hidden)."""
+        """Run only the MTP / NextN draft layer. Returns (logits, hidden)."""
         assert torch.cuda.current_stream() == self.stream
+        gr = self.graph_runner
+        if batch.is_decode and batch.padded_size in getattr(gr, "mtp_graph_map", {}):
+            return gr.replay_mtp(batch, input_ids)
         batch.input_ids = input_ids
         with self.ctx.forward_batch(batch):
             return self.model.forward_mtp()
