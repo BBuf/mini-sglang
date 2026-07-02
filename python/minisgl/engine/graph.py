@@ -100,7 +100,15 @@ class GraphRunner:
         self.dummy_req = dummy_req
         self.stream = stream
         self.device = device
-        self._capture_graphs(max_seq_len, vocab_size, model)
+        import contextlib
+
+        from minisgl.distributed import get_custom_ar
+
+        ca = get_custom_ar()
+        # the custom one-shot allreduce records graph buffer addresses during
+        # capture and registers them (IPC exchange) on context exit
+        with ca.capture() if ca is not None else contextlib.nullcontext():
+            self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}

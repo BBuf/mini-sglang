@@ -1,7 +1,8 @@
-from .impl import DistributedCommunicator, destroy_distributed, enable_pynccl_distributed
+from .impl import get_custom_ar, DistributedCommunicator, destroy_distributed, enable_pynccl_distributed
 from .info import DistributedInfo, get_tp_info, set_tp_info, try_get_tp_info
 
 __all__ = [
+    "get_custom_ar",
     "DistributedInfo",
     "get_tp_info",
     "set_tp_info",

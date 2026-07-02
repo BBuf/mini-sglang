@@ -210,8 +210,49 @@ class Engine:
 
         return min_free_memory, max_free_memory
 
+    _prof_state = {"n": 0, "prof": None}
+
+    def _maybe_profile(self, batch: Batch) -> None:
+        """Opt-in torch profiler over N decode steps: MINISGL_PROF_STEPS=<n>
+        (+ optional MINISGL_PROF_START, default 60). rank0 writes a self-CUDA-time
+        table and a chrome trace under MINISGL_PROF_DIR (default /tmp)."""
+        import os
+
+        steps_env = os.environ.get("MINISGL_PROF_STEPS")
+        if not steps_env or not batch.is_decode:
+            return
+        st = self._prof_state
+        st["n"] += 1
+        start = int(os.environ.get("MINISGL_PROF_START", "60"))
+        steps = int(steps_env)
+        if st["n"] == start:
+            prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            )
+            prof.__enter__()
+            st["prof"] = prof
+        elif st["n"] == start + steps and st["prof"] is not None:
+            prof = st["prof"]
+            st["prof"] = None
+            torch.cuda.synchronize()
+            prof.__exit__(None, None, None)
+            if torch.distributed.get_rank() == 0:
+                out_dir = os.environ.get("MINISGL_PROF_DIR", "/tmp")
+                with open(f"{out_dir}/prof_table.txt", "w") as f:
+                    f.write(
+                        prof.key_averages().table(
+                            sort_by="self_cuda_time_total", row_limit=120
+                        )
+                    )
+                prof.export_chrome_trace(f"{out_dir}/prof_trace.json")
+                logger.info(f"Profiler dump written to {out_dir}/prof_table.txt")
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        self._maybe_profile(batch)
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
                 logits = self.graph_runner.replay(batch)

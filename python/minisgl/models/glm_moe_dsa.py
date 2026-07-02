@@ -297,12 +297,12 @@ class GlmMoeGate(BaseOP):
         self.e_score_correction_bias = torch.empty(config.num_experts, dtype=torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight.dtype != torch.float32:
-            # Cast once at first forward and keep fp32 (the loader's dtype assert
-            # forces the declared param to match the bf16 checkpoint). Re-casting
-            # the [E, hidden] weight every call costs ~7us/layer at bs=1.
-            self.weight = self.weight.to(torch.float32)
-        return F.linear(x.to(torch.float32), self.weight)
+        from minisgl.kernel import router_gemv
+
+        # One CUDA GEMV kernel (block per expert, bf16 in / fp32 accum) replaces
+        # cast-to-fp32 + cublas simt sgemm (~13us/layer at bs=4). fp32 logits
+        # are still required (see the bias note above).
+        return router_gemv(x, self.weight)
 
 
 class Fp8Experts(BaseOP):
@@ -315,6 +315,29 @@ class Fp8Experts(BaseOP):
         self.down_proj_scale_inv = torch.empty(
             num_experts, div_ceil(hidden, 128), div_ceil(inter_tp, 128), dtype=torch.float32
         )
+
+
+_trtllm_moe_ok = None
+
+
+def _use_trtllm_moe() -> bool:
+    # flashinfer's trtllm-gen fused MoE (opt-in via MINISGL_TRTLLM_MOE=1).
+    # Measured on 8xB300 vs the tuned triton path: only ~38us vs ~47us per layer
+    # at M=4, and its intermediate quantization is ~3x noisier (cos-to-true
+    # 0.9971 vs 0.9990), which visibly degrades long generations. Kept for
+    # future FP4 / retuned-kernel experiments.
+    global _trtllm_moe_ok
+    if _trtllm_moe_ok is None:
+        if os.environ.get("MINISGL_TRTLLM_MOE", "0") != "1":
+            _trtllm_moe_ok = False
+        else:
+            try:
+                from flashinfer.fused_moe import trtllm_fp8_block_scale_moe  # noqa: F401
+
+                _trtllm_moe_ok = True
+            except Exception:
+                _trtllm_moe_ok = False
+    return _trtllm_moe_ok
 
 
 _fused_gate = None
@@ -411,20 +434,54 @@ class GlmSparseMoE(BaseOP):
 
     _route = _moe_route
 
+    def _trtllm_moe(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        # One trtllm-gen kernel fuses routing (DeepSeekV3 sigmoid+bias top-k),
+        # both fp8 block-scale GEMMs, SwiGLU and the weighted finalize —
+        # replacing the whole moe_fused_gate/quant/align/sort/gemm/act/sum chain
+        # (~66us -> ~38us per layer at M=4 on B300).
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+        from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+
+        aq, asf = per_token_group_quant_fp8(x, _BLOCK[1], column_major_scales=True)
+        out = trtllm_fp8_block_scale_moe(
+            router_logits,
+            self.gate.e_score_correction_bias,
+            aq,
+            asf.t(),
+            self.experts.gate_up_proj,
+            self.experts.gate_up_proj_scale_inv,
+            self.experts.down_proj,
+            self.experts.down_proj_scale_inv,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            n_group=self.n_group,
+            topk_group=self.topk_group,
+            intermediate_size=self.experts.down_proj.shape[2],
+            local_expert_offset=0,
+            local_num_experts=self.num_experts,
+            routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=2,  # DeepSeekV3: sigmoid + bias grouped top-k
+            norm_topk_prob=self.norm_topk_prob,
+        )
+        return out[0] if isinstance(out, (list, tuple)) else out
+
     @nvtx_annotate("MoE")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = x.shape
         x = x.view(-1, hidden_dim)
-        topk_ids, topk_w = self._route(self.gate.forward(x))
+        router_logits = self.gate.forward(x)
         # Shared-expert partial WITHOUT its row-parallel all-reduce: since
         # all-reduce is linear, summing routed+shared partials first and reducing
         # once is equivalent and saves one all-reduce per MoE layer.
         se = self.shared_experts
         shared = F.linear(se.act_fn(se.gate_up_proj.forward(x)), se.down_proj.weight)
 
-        if self.is_fp8:
+        if self.is_fp8 and _use_trtllm_moe():
+            routed = self._trtllm_moe(x.contiguous(), router_logits)
+        elif self.is_fp8:
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts_impl
 
+            topk_ids, topk_w = self._route(router_logits)
             routed = fused_experts_impl(
                 x.contiguous(),
                 self.experts.gate_up_proj,
@@ -440,6 +497,7 @@ class GlmSparseMoE(BaseOP):
         else:
             from minisgl.moe.fused import fused_experts_impl
 
+            topk_ids, topk_w = self._route(router_logits)
             routed = fused_experts_impl(
                 x.contiguous(),
                 self.experts.gate_up_proj,
