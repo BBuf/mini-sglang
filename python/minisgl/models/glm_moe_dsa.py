@@ -52,6 +52,27 @@ def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
+_fused_rope = None
+
+
+def _get_fused_rope(rope_dim: int, dtype: torch.dtype):
+    # sglang's CUDA jit fused_rope applies GPT-J interleaved RoPE to q/k in place,
+    # consuming positions + an fp32 cos/sin cache: one kernel replaces the whole
+    # eager rope chain (casts/mul/add/stack, ~10 tiny kernels per layer) plus the
+    # per-forward cos/sin computation. Compile eagerly so a broken toolchain falls
+    # back to the eager path instead of crashing mid-forward.
+    global _fused_rope
+    if _fused_rope is None:
+        try:
+            from sglang.jit_kernel.rope import _jit_fused_rope_module, apply_rope_inplace
+
+            _jit_fused_rope_module(False, rope_dim, dtype)
+            _fused_rope = apply_rope_inplace
+        except Exception:
+            _fused_rope = False
+    return _fused_rope
+
+
 def _rope_cos_sin(positions: torch.Tensor, dim: int, base: float):
     # Compute GPT-J interleaved RoPE cos/sin ONCE per forward. positions are identical
     # across all layers, so this is shared instead of recomputed 78x (a big kernel-count
@@ -207,7 +228,17 @@ class GlmMLAAttention(BaseOP):
         k_compressed = self.kv_a_layernorm.forward(k_compressed.contiguous())
 
         k_pe = k_pe.reshape(T, 1, self.qk_rope_head_dim)
-        q_pe, k_pe = self._apply_rope(q_pe, k_pe, cos, sin)  # q_pe [T,H,rope], k_pe [T,1,rope]
+        if sin is None:
+            # Fused-rope mode: `cos` carries the fp32 [max_pos, rope_dim] cos/sin
+            # cache (see GlmMoeDsaModel.forward). In-place CUDA kernel; the
+            # .contiguous() copies were needed downstream anyway.
+            q_pe = q_pe.contiguous()
+            k_pe = k_pe.contiguous()
+            _get_fused_rope(self.qk_rope_head_dim, q_pe.dtype)(
+                q_pe, k_pe, cos, ctx.batch.positions, is_neox=False
+            )
+        else:
+            q_pe, k_pe = self._apply_rope(q_pe, k_pe, cos, sin)  # [T,H,rope], [T,1,rope]
 
         if hasattr(backend, "forward_mla"):
             # ---- absorbed MLA: attention in the kv_lora latent space ----
@@ -419,11 +450,37 @@ class GlmMoeDsaModel(BaseOP):
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self._rope_dim = config.qk_rope_head_dim
         self._rope_base = float(config.rotary_config.base)
+        self._rope_max_position = config.rotary_config.max_position
+        self._cos_sin_cache: torch.Tensor | None = None
+
+    def _rope_cache(self, device: torch.device) -> torch.Tensor:
+        # fp32 [P, rope_dim] cache for the fused rope kernel: first half cos, second
+        # half sin, NON-interleaved frequencies (the kernel pairs (2i, 2i+1) itself).
+        # Sized by the engine's real max seq len (page_table cols), not the model's
+        # nominal max_position (1M for GLM-5.2, which would be a 256MB buffer).
+        if self._cos_sin_cache is None:
+            P = min(int(get_global_ctx().page_table.shape[1]) + 1, self._rope_max_position)
+            inv_freq = 1.0 / (
+                self._rope_base
+                ** (
+                    torch.arange(0, self._rope_dim, 2, dtype=torch.float32, device=device)
+                    / self._rope_dim
+                )
+            )
+            freqs = torch.outer(torch.arange(P, dtype=torch.float32, device=device), inv_freq)
+            self._cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1).contiguous()
+        return self._cos_sin_cache
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
-        # RoPE cos/sin computed ONCE per forward, shared across all layers.
-        cos, sin = _rope_cos_sin(get_global_ctx().batch.positions, self._rope_dim, self._rope_base)
+        positions = get_global_ctx().batch.positions
+        if _get_fused_rope(self._rope_dim, torch.bfloat16):
+            # Fused rope: pass the cache via the `cos` slot with sin=None as the
+            # sentinel; each layer runs one CUDA kernel off positions + cache.
+            cos, sin = self._rope_cache(positions.device), None
+        else:
+            # RoPE cos/sin computed ONCE per forward, shared across all layers.
+            cos, sin = _rope_cos_sin(positions, self._rope_dim, self._rope_base)
         residual = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, cos, sin, residual)
