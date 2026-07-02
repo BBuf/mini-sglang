@@ -63,6 +63,7 @@ class SpecManager:
         # drafts are copied to pinned host memory as they are produced, so the
         # verify round reads them without a blocking .cpu()
         self._drafts_gpu = torch.empty(steps, dtype=torch.int32, device=self.device)
+        self._chain_pos_buf = torch.empty(1, dtype=torch.int32, device=self.device)
         self._drafts_pin = torch.empty(steps, dtype=torch.int32, pin_memory=True)
         self._drafts_event = torch.cuda.Event()
 
@@ -92,8 +93,13 @@ class SpecManager:
         positions: torch.Tensor,  # int32 gpu, attention position per row
         phase: str,
         use_graph: bool,
+        reuse_bt: bool = False,
     ) -> Tuple[Batch, torch.Tensor, torch.Tensor]:
         batch = Batch(reqs=[_VirtualReq(req, c, d) for c, d in rows], phase=phase)
+        if reuse_bt:
+            # chained MTP drafts hit the same page-table row the extend pass just
+            # bound; skip recomputing/copying the block table
+            batch.spec_reuse_bt = True
         if use_graph:
             self.engine.graph_runner.pad_batch(batch)
         else:
@@ -160,8 +166,11 @@ class SpecManager:
         self._drafts_gpu[0] = prev_draft[0]
         for i in range(1, self.k):
             pos = next_pos + i - 1
-            positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
-            b, _, _ = self._make_batch(req, [(pos, pos + 1)], positions, "decode", True)
+            positions = self._chain_pos_buf
+            positions.fill_(pos)
+            b, _, _ = self._make_batch(
+                req, [(pos, pos + 1)], positions, "decode", True, reuse_bt=True
+            )
             b.spec_prev_hidden = prev_hidden
             logits, mtp_hidden = self.engine.forward_mtp_batch(b, prev_draft)
             prev_draft = torch.argmax(logits[:1], dim=-1).to(torch.int32)

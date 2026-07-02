@@ -157,7 +157,12 @@ class MLABackend(BaseAttnBackend):
         assert isinstance(metadata, MLAMetadata)
         self.kvcache.store_kv(ckv, k_pe, batch.out_loc, layer_id)
         if metadata.use_trtllm:
-            q = torch.cat([q_nope, q_pe], dim=-1)
+            try:
+                from sgl_kernel import concat_mla_absorb_q
+
+                q = concat_mla_absorb_q(q_nope, q_pe)
+            except ImportError:
+                q = torch.cat([q_nope, q_pe], dim=-1)
             out = self._trtllm_decode(
                 query=q.unsqueeze(1),
                 kv_cache=self.kvcache.combined_cache(layer_id).unsqueeze(1),
@@ -190,29 +195,46 @@ class MLABackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
         ps = self.page_size
-        seqlens_q = [req.extend_len for req in reqs]
         seqlens_k = [req.device_len for req in reqs]
-        num_blocks = [-(-l // ps) for l in seqlens_k]
         CPU = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
-        qo_indptr = torch.tensor([0] + seqlens_q, **CPU).cumsum_(0).to(torch.int32)
-        kv_indptr = torch.tensor([0] + num_blocks, **CPU).cumsum_(0).to(torch.int32)
         kv_len_arr = torch.tensor(seqlens_k, **CPU)
         dev = self.device
         use_trtllm = self.use_trtllm_decode and batch.is_decode
         page_table = get_global_ctx().page_table
         if use_trtllm:
-            kv_indices = torch.empty(0, dtype=torch.int32, device=dev)
-        else:
-            kv_indices = torch.cat(
-                [
-                    torch.div(
-                        page_table[req.table_idx, : req.device_len : ps],
-                        ps,
-                        rounding_mode="floor",
-                    )
-                    for req in reqs
-                ]
+            # the trtllm decode path reads only kv_len_arr + block_tables; skip
+            # the indptr construction (2 pinned allocs + copies per batch).
+            kv_len_gpu = kv_len_arr.to(dev, non_blocking=True)
+            batch.attn_metadata = MLAMetadata(
+                qo_indptr=kv_len_gpu,  # placeholder, unused on this path
+                kv_indptr=kv_len_gpu,
+                kv_indices=kv_len_gpu,
+                kv_len_arr=kv_len_gpu,
+                num_heads=self.num_heads_local,
+                causal=True,
+                wrapper=self.wrapper,
+                use_trtllm=True,
+                block_tables=(
+                    None
+                    if getattr(batch, "spec_reuse_bt", False)
+                    else self._block_tables_for(batch)
+                ),
             )
+            return
+        seqlens_q = [req.extend_len for req in reqs]
+        num_blocks = [-(-l // ps) for l in seqlens_k]
+        qo_indptr = torch.tensor([0] + seqlens_q, **CPU).cumsum_(0).to(torch.int32)
+        kv_indptr = torch.tensor([0] + num_blocks, **CPU).cumsum_(0).to(torch.int32)
+        kv_indices = torch.cat(
+            [
+                torch.div(
+                    page_table[req.table_idx, : req.device_len : ps],
+                    ps,
+                    rounding_mode="floor",
+                )
+                for req in reqs
+            ]
+        )
         batch.attn_metadata = MLAMetadata(
             qo_indptr=qo_indptr.to(dev, non_blocking=True),
             kv_indptr=kv_indptr.to(dev, non_blocking=True),
@@ -221,8 +243,6 @@ class MLABackend(BaseAttnBackend):
             num_heads=self.num_heads_local,
             causal=True,
             wrapper=self.wrapper,
-            use_trtllm=use_trtllm,
-            block_tables=self._block_tables_for(batch) if use_trtllm else None,
         )
 
     # ----- cuda graph -----
@@ -258,12 +278,15 @@ class MLABackend(BaseAttnBackend):
 
     def _bind_capture_buffers(self, metadata: MLAMetadata, bs: int) -> None:
         """Copy the freshly computed values into the static capture buffers and
-        point the metadata at them, so graph replays see the updates."""
+        point the metadata at them, so graph replays see the updates. When
+        block_tables is None (speculative chained drafts on the same request),
+        the rows already sitting in the capture buffer are reused as-is."""
         cap = self.capture
-        assert cap is not None and metadata.block_tables is not None
+        assert cap is not None
         cap.seq_lens[:bs].copy_(metadata.kv_len_arr[:bs])
-        w = metadata.block_tables.shape[1]
-        cap.block_tables[:bs, :w].copy_(metadata.block_tables)
+        if metadata.block_tables is not None:
+            w = metadata.block_tables.shape[1]
+            cap.block_tables[:bs, :w].copy_(metadata.block_tables)
         metadata.kv_len_arr = cap.seq_lens[:bs]
         metadata.block_tables = cap.block_tables[:bs]
 
