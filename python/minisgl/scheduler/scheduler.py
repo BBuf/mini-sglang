@@ -84,6 +84,7 @@ class Scheduler(SchedulerIOMixin):
             from .spec import SpecManager
 
             self.spec = SpecManager(self, spec_steps)
+            self.engine.graph_runner.capture_mtp_chain(self.token_pool)
             logger.info_rank0(f"MTP speculative decoding enabled: k={spec_steps}")
 
     def run_when_idle(self) -> None:

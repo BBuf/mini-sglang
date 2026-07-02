@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import os
+
 import torch
 from minisgl.core import Batch, Req
 from minisgl.message import DetokenizeMsg
@@ -64,6 +66,10 @@ class SpecManager:
         # verify round reads them without a blocking .cpu()
         self._drafts_gpu = torch.empty(steps, dtype=torch.int32, device=self.device)
         self._chain_pos_buf = torch.empty(1, dtype=torch.int32, device=self.device)
+        CPU = {"dtype": torch.int32, "pin_memory": True}
+        self._pin_pos = torch.empty(max(steps - 1, 1), **CPU)
+        self._pin_seq = torch.empty(max(steps - 1, 1), **CPU)
+        self._pin_tok = torch.empty(steps, dtype=torch.int64, pin_memory=True)
         self._drafts_pin = torch.empty(steps, dtype=torch.int32, pin_memory=True)
         self._drafts_event = torch.cuda.Event()
 
@@ -194,16 +200,12 @@ class SpecManager:
         return req
 
     def run_round(self, req: Req) -> None:
-        import time
-
-        t0 = time.perf_counter()
         k = self.k
         D = req.device_len
         table = req.table_idx
         self._ensure_pages(req, D + 2 * k + 1)
 
         # ---- verify: k+1 staggered rows through the normal (graphed) decode path
-        self._drafts_event.synchronize()
         drafts_cpu = self._drafts_pin
         rows = [(D - 1 + i, D + i) for i in range(k + 1)]
         positions = torch.arange(D - 1, D + k, dtype=torch.int32, device=self.device)
@@ -215,7 +217,7 @@ class SpecManager:
 
         # ---- accept the longest matching prefix (+ the bonus prediction)
         out.copy_done_event.synchronize()
-        t1 = time.perf_counter()
+        self._drafts_event.synchronize()  # ordered earlier on the stream: ~free
         preds_cpu = out.next_tokens_cpu[: k + 1]
         n = 0
         while n < k and int(preds_cpu[n]) == int(drafts_cpu[n]):
@@ -236,12 +238,17 @@ class SpecManager:
             accepted = accepted[:n_new]
             finished = True
 
-        # publish accepted tokens (idempotent for the matched prefix) + host state
+        # publish accepted tokens (idempotent for the matched prefix); the host
+        # bookkeeping (append/detok/send) happens AFTER the draft phase is
+        # launched so it overlaps the draft GPU work
         self._token_pool[table, D : D + n_new] = out.next_tokens_gpu[:n_new]
         req.cached_len = D + n_new - 1
         req.device_len = D + n_new
-        req.append_host(accepted.to(torch.int32))
 
+        if not finished:
+            self._refill_drafts(req, hidden, D, n_new, table)
+
+        req.append_host(accepted.to(torch.int32))
         self.s.send_result(
             [
                 DetokenizeMsg(
@@ -252,37 +259,62 @@ class SpecManager:
                 for i, t in enumerate(accepted)
             ]
         )
-
         if finished:
             self.finish_req(req)
-            return
+        return
 
+    def _refill_drafts(self, req: Req, hidden, D: int, n_new: int, table: int) -> None:
         # ---- refill drafts: MTP extend over the accepted rows, then chain
+        k = self.k
         m = n_new  # rows D-1 .. D-1+m-1 consume tokens D..D+m-1 and hidden rows 0..m-1
         positions = torch.arange(D - 1, D - 1 + m, dtype=torch.int32, device=self.device)
         rows = [(D - 1 + i, D + i) for i in range(m)]
         mtp_batch, tbl, out_pos = self._make_batch(req, rows, positions, "decode", True)
         mtp_batch.spec_prev_hidden = hidden[: mtp_batch.padded_size]
         input_ids = self._token_pool[(tbl, out_pos + 1)]
-        logits, mtp_hidden = self.engine.forward_mtp_batch(mtp_batch, input_ids)
-        d = torch.argmax(logits[m - 1 : m], dim=-1).to(torch.int32)
         J = D + n_new - 2  # last accepted main position
-        self._token_pool[table, J + 2] = d[0]
-        self._chain_drafts(req, next_pos=J + 1, prev_draft=d, prev_hidden=mtp_hidden[m - 1 : m])
+        gr = self.engine.graph_runner
+        if (
+            getattr(gr, "mtp_chain_graph", None) is not None
+            and mtp_batch.padded_size in gr.mtp_graph_map
+            and os.environ.get("MINISGL_CHAIN_GRAPH", "1") == "1"
+        ):
+            # fused chain: the extend replay leaves logits/hidden in the MTP
+            # buffers; one more replay runs argmax->emb->layer x (k-1) plus the
+            # token_pool scatter of all k drafts entirely in-graph.
+            self.engine.forward_mtp_batch(mtp_batch, input_ids)
+            k1 = self.k - 1
+            base = J + 1
+            gr.chain_row.fill_(m - 1)
+            torch.arange(base, base + k1, dtype=torch.int32, out=self._pin_pos[:k1])
+            torch.arange(base + 1, base + k1 + 1, dtype=torch.int32, out=self._pin_seq[:k1])
+            W = self._token_pool.shape[1]
+            torch.arange(
+                table * W + J + 2, table * W + J + 2 + self.k, dtype=torch.int64,
+                out=self._pin_tok[: self.k],
+            )
+            gr.chain_pos.copy_(self._pin_pos[:k1], non_blocking=True)
+            gr.chain_seq.copy_(self._pin_seq[:k1], non_blocking=True)
+            gr.chain_tok_idx.copy_(self._pin_tok[: self.k], non_blocking=True)
+            gr.chain_out_loc.copy_(self._page_table[table, base : base + k1])
+            gr.mtp_chain_graph.replay()
+            self._drafts_pin.copy_(gr.chain_drafts[: self.k], non_blocking=True)
+            self._drafts_event.record()
+        else:
+            logits, mtp_hidden = self.engine.forward_mtp_batch(mtp_batch, input_ids)
+            d = torch.argmax(logits[m - 1 : m], dim=-1).to(torch.int32)
+            self._token_pool[table, J + 2] = d[0]
+            self._chain_drafts(
+                req, next_pos=J + 1, prev_draft=d, prev_hidden=mtp_hidden[m - 1 : m]
+            )
 
         self._rounds += 1
         self._accepted += n_new
-        if self._log_stats:
-            torch.cuda.synchronize()
-            t2 = time.perf_counter()
-            self._t_verify += t1 - t0
-            self._t_draft += t2 - t1
-            if self._rounds % 50 == 0:
-                logger.info_rank0(
-                    f"[spec] rounds={self._rounds} mean_accept={self._accepted / self._rounds:.2f} "
-                    f"verify={1e3 * self._t_verify / self._rounds:.2f}ms "
-                    f"draft={1e3 * self._t_draft / self._rounds:.2f}ms"
-                )
+        if self._log_stats and self._rounds % 50 == 0:
+            logger.info_rank0(
+                f"[spec] rounds={self._rounds} "
+                f"mean_accept={self._accepted / self._rounds:.2f}"
+            )
 
     # ------------------------------------------------------------- cleanup ----
     def _free_tail(self, req: Req, alloc_len: int) -> None:

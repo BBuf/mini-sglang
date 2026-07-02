@@ -173,6 +173,7 @@ class GraphRunner:
         import os
 
         self.mtp_graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.mtp_chain_graph = None
         spec_steps = int(os.environ.get("MINISGL_SPEC_STEPS", "0"))
         if spec_steps <= 0 or not hasattr(model, "forward_mtp"):
             return
@@ -212,6 +213,86 @@ class GraphRunner:
                     self.mtp_buffer.logits[:bs] = logits
                     self.mtp_hidden_out[:bs] = hidden
             self.mtp_graph_map[bs] = graph
+
+        self._chain_args = (model, pool, spec_steps)
+
+    def capture_mtp_chain(self, token_pool: torch.Tensor) -> None:
+        """Deferred (token_pool is created by the scheduler after engine init)."""
+        if self.mtp_chain_graph is not None or not hasattr(self, "_chain_args"):
+            return
+        model, pool, k = self._chain_args
+        self.chain_token_pool = token_pool
+        try:
+            self._capture_mtp_chain(model, pool, k)
+        except Exception as e:
+            logger.warning(f"MTP chain graph unavailable, per-step fallback: {e}")
+            self.mtp_chain_graph = None
+
+    def _capture_mtp_chain(self, model: BaseLLMModel, pool, k: int) -> None:
+        """Speculative draft chain (steps 2..k) as ONE graph: each step feeds the
+        previous step's in-graph argmax into the embedding, runs the MTP layer +
+        shared head, and the final scatter writes all k drafts into token_pool.
+        Removes the per-step python/replay orchestration (~0.13ms x k-1)."""
+        self.mtp_chain_graph = None
+        C = k - 1
+        if C < 1:
+            return
+        dev = self.device
+        H = self.mtp_hidden_in.shape[1]
+        # round inputs, filled by the scheduler before replay
+        self.chain_pos = torch.zeros(C, dtype=torch.int32, device=dev)      # attn positions
+        self.chain_seq = torch.zeros(C, dtype=torch.int32, device=dev)      # kv lens
+        self.chain_out_loc = torch.zeros(C, dtype=torch.int32, device=dev)  # MTP-KV slots
+        self.chain_row = torch.zeros(1, dtype=torch.int64, device=dev)      # extend's last real row
+        self.chain_tok_idx = torch.zeros(k, dtype=torch.int64, device=dev)  # token_pool flat slots
+        self.chain_drafts = torch.zeros(k, dtype=torch.int32, device=dev)   # d_1..d_k
+
+        from minisgl.attention.mla import MLAMetadata
+
+        cap = self.attn_backend.capture
+        buf_logits, buf_hidden = self.mtp_buffer.logits, self.mtp_hidden_out
+        batches = []
+        for i in range(C):
+            b = Batch(reqs=[self.dummy_req], phase="decode")
+            b.padded_reqs = b.reqs
+            b.positions = self.chain_pos[i : i + 1]
+            b.out_loc = self.chain_out_loc[i : i + 1]
+            b.attn_metadata = MLAMetadata(
+                qo_indptr=self.chain_seq[i : i + 1],
+                kv_indptr=self.chain_seq[i : i + 1],
+                kv_indices=self.chain_seq[i : i + 1],
+                kv_len_arr=self.chain_seq[i : i + 1],
+                num_heads=self.attn_backend.num_heads_local,
+                causal=True,
+                wrapper=self.attn_backend.wrapper,
+                use_trtllm=True,
+                block_tables=cap.block_tables[:1],
+                initialized=True,
+            )
+            batches.append(b)
+
+        def run_chain():
+            d = torch.argmax(
+                buf_logits.index_select(0, self.chain_row), dim=-1
+            ).to(torch.int32)
+            h = buf_hidden.index_select(0, self.chain_row)
+            self.chain_drafts[0:1] = d
+            for i in range(C):
+                b = batches[i]
+                b.spec_prev_hidden = h
+                b.input_ids = d
+                with get_global_ctx().forward_batch(b):
+                    logits, h = model.forward_mtp()
+                d = torch.argmax(logits[:1], dim=-1).to(torch.int32)
+                self.chain_drafts[i + 1 : i + 2] = d
+            self.chain_token_pool.view(-1)[self.chain_tok_idx] = self.chain_drafts
+
+        graph = torch.cuda.CUDAGraph()
+        run_chain()  # warmup (also lockstep across TP ranks)
+        with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+            run_chain()
+        self.mtp_chain_graph = graph
+        logger.info_rank0(f"Captured fused MTP chain graph ({C} steps)")
 
     def replay_mtp(self, batch: Batch, input_ids: torch.Tensor):
         bs = batch.padded_size
