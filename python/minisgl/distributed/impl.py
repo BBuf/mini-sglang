@@ -115,7 +115,9 @@ def enable_pynccl_distributed(
 
     import os
 
-    if os.environ.get("MINISGL_CUSTOM_AR", "1") != "1":
+    # opt-in: measured slower than NCCL NVLS on B300 (32us vs 20.4us per call),
+    # and newer sglang trees pull heavyweight deps on this import path
+    if os.environ.get("MINISGL_CUSTOM_AR", "0") != "1":
         return
     try:
         from sglang.srt.distributed.device_communicators import (

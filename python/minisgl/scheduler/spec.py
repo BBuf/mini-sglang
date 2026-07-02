@@ -80,7 +80,10 @@ class SpecManager:
         if need_len > st.alloc_len:
             v = _VirtualReq(req, st.alloc_len, need_len)
             self.s.cache_manager.allocate_paged([v])
-            st.alloc_len = need_len
+            # allocate_paged rounds up to whole pages; track the aligned mark so
+            # the tail frees below release exactly what was allocated
+            ps = self.s.cache_manager.page_size
+            st.alloc_len = -(-need_len // ps) * ps
 
     def _make_batch(
         self,
@@ -273,23 +276,27 @@ class SpecManager:
                 )
 
     # ------------------------------------------------------------- cleanup ----
+    def _free_tail(self, req: Req, alloc_len: int) -> None:
+        # free the whole pages past the request's live region; the partial page
+        # containing cached_len (if any) is owned/freed by cache_req, and _free
+        # picks page starts by striding, so the slice must begin page-aligned
+        ps = self.s.cache_manager.page_size
+        start = -(-req.cached_len // ps) * ps
+        if alloc_len > start:
+            self.s.cache_manager._free(self._page_table[req.table_idx, start:alloc_len])
+
     def finish_req(self, req: Req) -> None:
         st = self.states.pop(req.uid, None)
         self.s.decode_manager.remove_req(req)
         self.s._free_req_resources(req)
-        if st is not None and st.alloc_len > req.cached_len:
-            # tail pages beyond what cache_req saw
-            self.s.cache_manager._free(
-                self._page_table[req.table_idx, req.cached_len : st.alloc_len]
-            )
+        if st is not None:
+            self._free_tail(req, st.alloc_len)
 
     def drop_req(self, req: Req) -> None:
         """Called when a spec'd request degrades to the normal decode path (its
-        drafts / hidden chain are gone) or gets aborted. Frees everything from
-        cached_len up: the normal path's allocate_paged re-allocates
-        [cached_len, device_len) itself, so leaving those pages would orphan them."""
+        drafts / hidden chain are gone) or gets aborted. The normal path's
+        allocate_paged re-allocates from cached_len itself, so everything from
+        the next page boundary up is released here."""
         st = self.states.pop(req.uid, None)
-        if st is not None and st.alloc_len > req.cached_len:
-            self.s.cache_manager._free(
-                self._page_table[req.table_idx, req.cached_len : st.alloc_len]
-            )
+        if st is not None:
+            self._free_tail(req, st.alloc_len)
