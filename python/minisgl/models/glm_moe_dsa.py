@@ -317,6 +317,28 @@ class Fp8Experts(BaseOP):
         )
 
 
+class Fp4Experts(BaseOP):
+    """NVFP4 (W4A4, group-16) routed experts, as exported by compressed-tensors
+    checkpoints like nvidia/GLM-5.2-NVFP4. Weights are packed 2-per-byte with
+    fp8 block scales and per-tensor global scales; the trtllm-gen FP4 MoE kernel
+    consumes shuffled copies built lazily on first forward."""
+
+    def __init__(self, num_experts: int, hidden: int, inter_tp: int):
+        FP8 = torch.float8_e4m3fn
+        self.gate_up_proj = torch.empty(num_experts, 2 * inter_tp, hidden // 2, dtype=torch.uint8)
+        self.gate_up_proj_scale = torch.empty(num_experts, 2 * inter_tp, hidden // 16, dtype=FP8)
+        self.gate_up_proj_gscale = torch.empty(num_experts, 2, dtype=torch.float32)
+        self.gate_up_proj_in_gscale = torch.empty(num_experts, 2, dtype=torch.float32)
+        self.down_proj = torch.empty(num_experts, hidden, inter_tp // 2, dtype=torch.uint8)
+        self.down_proj_scale = torch.empty(num_experts, hidden, inter_tp // 16, dtype=FP8)
+        self.down_proj_gscale = torch.empty(num_experts, 1, dtype=torch.float32)
+        self.down_proj_in_gscale = torch.empty(num_experts, 1, dtype=torch.float32)
+
+
+# activation global scales of the last quantized main layer, borrowed by the
+# MTP layer's on-the-fly expert quantization (no calibration data of its own)
+_last_fp4_act_scales = {}
+
 _trtllm_moe_ok = None
 
 
@@ -406,11 +428,22 @@ def _moe_route(self, router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.T
 
 
 class GlmSparseMoE(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, quantized: bool = True):
         tp = get_tp_info().size
         self.gate = GlmMoeGate(config)
-        self.is_fp8 = config.is_fp8
-        if config.is_fp8:
+        self.is_fp8 = config.is_fp8 and quantized
+        self.is_fp4 = config.is_fp4 and quantized
+        self._fp4 = None  # trtllm-shuffled weights + alphas, built on first forward
+        self._mtp_fp4_pending = (
+            config.is_fp4
+            and not quantized
+            and os.environ.get("MINISGL_MTP_FP4", "1") == "1"
+        )
+        if self.is_fp4:
+            self.experts = Fp4Experts(
+                config.num_experts, config.hidden_size, div_even(config.moe_intermediate_size, tp)
+            )
+        elif config.is_fp8 and quantized:
             self.experts = Fp8Experts(
                 config.num_experts, config.hidden_size, div_even(config.moe_intermediate_size, tp)
             )
@@ -433,6 +466,116 @@ class GlmSparseMoE(BaseOP):
         self._tp = tp
 
     _route = _moe_route
+
+    def _quantize_bf16_experts_to_fp4(self) -> None:
+        from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+        e = self.experts  # bf16 MoELayer-style weights [E, 2I, H] / [E, H, I]
+        E = self.num_experts
+        FP4_MAX, FP8_MAX = 6.0, 448.0
+
+        def quant(w):
+            gs = (FP4_MAX * FP8_MAX) / w.float().abs().amax(dim=(1, 2))
+            packed, scales = [], []
+            for i in range(E):
+                p, sc = fp4_quantize(w[i].to(torch.bfloat16), gs[i : i + 1], 16, False, False)
+                packed.append(p)
+                scales.append(sc.reshape(w.shape[1], -1))
+            return torch.stack(packed), torch.stack(scales).view(torch.float8_e4m3fn), (1.0 / gs)
+
+        gu_p, gu_s, gu_s2 = quant(e.gate_up_proj)
+        dn_p, dn_s, dn_s2 = quant(e.down_proj)
+        fp4 = Fp4Experts.__new__(Fp4Experts)
+        fp4.gate_up_proj = gu_p
+        fp4.gate_up_proj_scale = gu_s
+        fp4.gate_up_proj_gscale = torch.stack([gu_s2, gu_s2], dim=1)
+        fp4.gate_up_proj_in_gscale = _last_fp4_act_scales["in1"].reshape(1, 1).expand(E, 2)
+        fp4.down_proj = dn_p
+        fp4.down_proj_scale = dn_s
+        fp4.down_proj_gscale = dn_s2.reshape(E, 1)
+        fp4.down_proj_in_gscale = _last_fp4_act_scales["in2"].reshape(1, 1).expand(E, 1)
+        self.experts = fp4
+        self.is_fp4 = True
+
+    def _prep_fp4(self) -> None:
+        # Mirror sglang's compressed-tensors NVFP4 flashinfer-trtllm prep:
+        # [gate;up] -> [up;gate] row order, invert global scales, precompute the
+        # per-expert alpha chain, and shuffle weights/scales for the kernel.
+        from sglang.srt.layers.quantization.utils import (
+            prepare_static_weights_for_trtllm_fp4_moe,
+            reorder_w1w3_to_w3w1,
+        )
+
+        e = self.experts
+        E = self.num_experts
+        hidden = e.down_proj.shape[1]
+        inter = e.down_proj.shape[2] * 2
+        w13, w13_s = reorder_w1w3_to_w3w1(e.gate_up_proj, e.gate_up_proj_scale, dim=-2)
+        g1w, g1s, g2w, g2s = prepare_static_weights_for_trtllm_fp4_moe(
+            w13, e.down_proj, w13_s, e.down_proj_scale, hidden, inter, E
+        )
+        # modelopt semantics: weight_scale_2 / input_scale are DEQUANT multipliers
+        # (no inversion); the kernel's activation-quant scale is their inverse.
+        w13_scale_2 = e.gate_up_proj_gscale[:, 0].float()
+        w2_scale_2 = e.down_proj_gscale[:, 0].float()
+        in1 = e.gate_up_proj_in_gscale.max().float()  # scalar, shared across experts
+        in2 = e.down_proj_in_gscale.max().float()
+        _last_fp4_act_scales["in1"] = in1
+        _last_fp4_act_scales["in2"] = in2
+        g1_alphas = (in1 * w13_scale_2).expand(E).contiguous()
+        self._fp4 = {
+            "g1w": g1w,
+            "g1s": g1s.view(torch.float8_e4m3fn),
+            "g2w": g2w,
+            "g2s": g2s.view(torch.float8_e4m3fn),
+            "g1_alphas": g1_alphas,
+            "g2_alphas": (in2 * w2_scale_2).expand(E).contiguous(),
+            "g1_scale_c": ((1.0 / in2) * g1_alphas).contiguous(),
+            "act_scale": (1.0 / in1).reshape(1).contiguous(),
+            "inter": inter,
+        }
+        # free the unshuffled originals
+        e.gate_up_proj = e.gate_up_proj_scale = None
+        e.down_proj = e.down_proj_scale = None
+
+    def _trtllm_fp4_moe(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        from flashinfer import trtllm_fp4_block_scale_moe
+        from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+        if self._fp4 is None:
+            self._prep_fp4()
+        p = self._fp4
+        M, H = x.shape
+        hb, sb = fp4_quantize(x, p["act_scale"], 16, False, False)
+        out = trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits,
+            routing_bias=self.gate.e_score_correction_bias,
+            hidden_states=hb.reshape(M, H // 2),
+            hidden_states_scale=sb.view(torch.float8_e4m3fn).reshape(*sb.shape[:-1], -1),
+            gemm1_weights=p["g1w"],
+            gemm1_weights_scale=p["g1s"],
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=p["g2w"],
+            gemm2_weights_scale=p["g2s"],
+            gemm2_bias=None,
+            output1_scale_scalar=p["g1_scale_c"],
+            output1_scale_gate_scalar=p["g1_alphas"],
+            output2_scale_scalar=p["g2_alphas"],
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            n_group=self.n_group,
+            topk_group=self.topk_group,
+            intermediate_size=p["inter"],
+            local_expert_offset=0,
+            local_num_experts=self.num_experts,
+            routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=2,  # DeepSeekV3: sigmoid + bias top-k, fp32 logits
+            do_finalize=True,
+        )[0]
+        return out
 
     def _trtllm_moe(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
         # One trtllm-gen kernel fuses routing (DeepSeekV3 sigmoid+bias top-k),
@@ -476,7 +619,16 @@ class GlmSparseMoE(BaseOP):
         se = self.shared_experts
         shared = F.linear(se.act_fn(se.gate_up_proj.forward(x)), se.down_proj.weight)
 
-        if self.is_fp8 and _use_trtllm_moe():
+        if (
+            not self.is_fp4
+            and self._mtp_fp4_pending
+            and _last_fp4_act_scales
+        ):
+            self._mtp_fp4_pending = False
+            self._quantize_bf16_experts_to_fp4()
+        if self.is_fp4:
+            routed = self._trtllm_fp4_moe(x.contiguous(), router_logits)
+        elif self.is_fp8 and _use_trtllm_moe():
             routed = self._trtllm_moe(x.contiguous(), router_logits)
         elif self.is_fp8:
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts_impl
@@ -519,7 +671,9 @@ class GlmMoeDsaDecoderLayer(BaseOP):
         if layer_id < config.first_k_dense_replace:
             self.mlp = _gated_mlp(config, config.intermediate_size)
         else:
-            self.mlp = GlmSparseMoE(config)
+            # modelopt NVFP4 checkpoints leave the MTP/NextN layer's experts
+            # unquantized (bf16), so quantization is per-layer
+            self.mlp = GlmSparseMoE(config, quantized=layer_id < config.num_layers)
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self._layer_id = layer_id

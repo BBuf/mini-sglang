@@ -81,6 +81,8 @@ def _dequant_block_fp8(
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
     """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
+    if value.ndim < 2:  # per-tensor scalars (e.g. nvfp4 global scales): replicate
+        return value
     if any(key.count(sub) for sub in _SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
         if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
@@ -121,6 +123,12 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     packed_name = match.group("name")
     if packed_name.endswith(_SCALE_SUFFIX):
         packed_name = packed_name[: -len(_SCALE_SUFFIX)] + "_scale_inv"
+    elif packed_name.endswith(".weight_scale_2"):  # nvfp4 (modelopt) global scale
+        packed_name = packed_name.removesuffix(".weight_scale_2") + "_gscale"
+    elif packed_name.endswith(".input_scale"):
+        packed_name = packed_name.removesuffix(".input_scale") + "_in_gscale"
+    elif packed_name.endswith(".weight_scale"):
+        packed_name = packed_name.removesuffix(".weight_scale") + "_scale"
     elif packed_name.endswith(".weight"):
         packed_name = packed_name.removesuffix(".weight")
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
@@ -153,17 +161,24 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 stripped = name.removeprefix("language_model.")
                 if config.num_nextn > 0:
                     stripped = _remap_mtp_key(stripped, config.num_layers)
-                # Only the routed experts stay FP8; all other fp8 weights are dequantized to bf16.
-                fp8_keep = is_fp8 and _EXPERT_PATTERN.match(stripped) is not None
+                # Only the routed experts stay quantized (FP8 or NVFP4); all other
+                # quantized weights are dequantized to bf16.
+                is_expert = _EXPERT_PATTERN.match(stripped) is not None
+                fp8_keep = is_fp8 and is_expert
+                fp4_keep = getattr(config, "is_fp4", False) and is_expert
                 if name.endswith(_SCALE_SUFFIX):
                     if not fp8_keep:  # scale consumed by dequant (or bf16 mode) -> drop
                         continue
+                if stripped.endswith((".k_scale", ".v_scale", ".q_scale")):
+                    continue  # kv-cache quant calibration scales: unused (bf16 KV)
                 if _should_skip_key(stripped, config.num_layers):
                     continue
                 raw = f.get_tensor(name)
-                if raw.dtype == torch.float8_e4m3fn and not fp8_keep:
+                if raw.dtype == torch.float8_e4m3fn and name.endswith(".weight") and not fp8_keep:
                     scale_key = name[: -len(".weight")] + _SCALE_SUFFIX
                     raw = _dequant_block_fp8(raw, f.get_tensor(scale_key))
+                if fp4_keep and raw.ndim == 0:
+                    raw = raw.reshape(1)  # scalars must be 1-D for merge/stack cat
                 name = stripped
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw

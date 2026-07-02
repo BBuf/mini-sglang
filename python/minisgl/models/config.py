@@ -44,6 +44,7 @@ class ModelConfig:
     n_group: int = 1
     topk_group: int = 1
     is_fp8: bool = False
+    is_fp4: bool = False
     num_nextn: int = 0
 
     @property
@@ -90,6 +91,17 @@ class ModelConfig:
             is_fp8 = qc.get("quant_method") == "fp8"
         else:
             is_fp8 = getattr(qc, "quant_method", None) == "fp8"
+        # compressed-tensors NVFP4 (e.g. nvidia/GLM-5.2-NVFP4): experts are
+        # W4A4 group-16, everything else stays high precision
+        def _is_nvfp4(q):
+            groups = (q.get("config_groups", {}) if isinstance(q, dict) else getattr(q, "config_groups", {}) or {})
+            for g in groups.values():
+                w = g.get("weights", {}) if isinstance(g, dict) else {}
+                if w.get("num_bits") == 4 and w.get("type") == "float":
+                    return True
+            return False
+
+        is_fp4 = qc is not None and _is_nvfp4(qc)
 
         if kv_lora_rank > 0:  # MLA (e.g. glm_moe_dsa / deepseek): use materialized head dim
             num_experts = getattr(config, "n_routed_experts", num_experts)
@@ -142,4 +154,5 @@ class ModelConfig:
             n_group=n_group,
             topk_group=topk_group,
             is_fp8=is_fp8,
+            is_fp4=is_fp4,
         )

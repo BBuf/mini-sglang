@@ -152,7 +152,7 @@ class Engine:
             }
         else:
             return {
-                k: (v if (v.dtype == torch.float8_e4m3fn or "_scale_inv" in k or "e_score_correction_bias" in k) else v.to(self.dtype))
+                k: (v if (v.dtype in (torch.float8_e4m3fn, torch.uint8) or "_scale_inv" in k or "_gscale" in k or "e_score_correction_bias" in k) else v.to(self.dtype))
                 for k, v in load_weight(config.model_path, self.device)
             }
 
