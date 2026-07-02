@@ -17,6 +17,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# flashinfer's "auto" resolves to fa2 on sm_103 (B300) because the fa3 gate is
+# sm90a-only; the cutlass backend is the Blackwell-native MLA kernel.
+import os
+
+_MLA_BACKEND = os.environ.get("MINISGL_MLA_BACKEND", "auto")
+
 
 @dataclass
 class MLACaptureData(BaseCaptureData):
@@ -66,7 +72,7 @@ class MLABackend(BaseAttnBackend):
         self.float_workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
-        self.wrapper = BatchMLAPagedAttentionWrapper(self.float_workspace_buffer, backend="auto")
+        self.wrapper = BatchMLAPagedAttentionWrapper(self.float_workspace_buffer, backend=_MLA_BACKEND)
 
         # cuda graph state
         self.capture_bs: List[int] = []
@@ -161,7 +167,7 @@ class MLABackend(BaseAttnBackend):
             kv_indptr=cap.cu_seqlens_k[: bs + 1],
             kv_indices=cap.page_table,
             kv_len_arr=cap.seq_lens[:bs],
-            backend="auto",
+            backend=_MLA_BACKEND,
         )
 
     def prepare_for_capture(self, batch: Batch) -> None:
