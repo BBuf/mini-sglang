@@ -79,6 +79,8 @@ class Batch:
     padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # optional: previous-step hidden states for the MTP draft layer (spec decode)
+    spec_prev_hidden: torch.Tensor | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

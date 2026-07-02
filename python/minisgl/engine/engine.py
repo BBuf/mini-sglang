@@ -88,6 +88,7 @@ class Engine:
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        self.num_nextn = config.model_config.num_nextn
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
@@ -165,7 +166,7 @@ class Engine:
                 (config.model_config.kv_lora_rank + config.model_config.qk_rope_head_dim)
                 * config.page_size
                 * self.dtype.itemsize
-                * config.model_config.num_layers
+                * (config.model_config.num_layers + config.model_config.num_nextn)
             )
         else:
             cache_per_page = (
@@ -174,7 +175,7 @@ class Engine:
                 * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
                 * config.page_size
                 * self.dtype.itemsize
-                * config.model_config.num_layers
+                * (config.model_config.num_layers + config.model_config.num_nextn)
             )
         num_pages = config.num_page_override
         if num_pages is None:
@@ -225,6 +226,22 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def get_last_hidden(self, batch: Batch) -> torch.Tensor:
+        """Pre-final-norm hidden of the rows of `batch`'s last forward (feeds the
+        MTP draft layer). Graphed batches read the per-graph capture buffer."""
+        if self.graph_runner.can_use_cuda_graph(batch):
+            return self.graph_runner.hidden_map[batch.padded_size]
+        return self.model.model._last_hidden
+
+    def forward_mtp_batch(
+        self, batch: Batch, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run only the MTP / NextN draft layer (eager). Returns (logits, hidden)."""
+        assert torch.cuda.current_stream() == self.stream
+        batch.input_ids = input_ids
+        with self.ctx.forward_batch(batch):
+            return self.model.forward_mtp()
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()

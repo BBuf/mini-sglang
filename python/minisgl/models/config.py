@@ -44,6 +44,7 @@ class ModelConfig:
     n_group: int = 1
     topk_group: int = 1
     is_fp8: bool = False
+    num_nextn: int = 0
 
     @property
     def is_moe(self) -> bool:
@@ -107,6 +108,7 @@ class ModelConfig:
 
         return cls(
             num_layers=config.num_hidden_layers,
+            num_nextn=getattr(config, "num_nextn_predict_layers", 0) or 0,
             num_qo_heads=config.num_attention_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,

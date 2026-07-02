@@ -33,6 +33,26 @@ _LAYER_IDX_PATTERN = re.compile(r"model\.layers\.(\d+)\.")
 _SCALE_SUFFIX = ".weight_scale_inv"
 
 
+def _remap_mtp_key(name: str, num_layers: int) -> str:
+    """The checkpoint stores the MTP / NextN draft layer as model.layers.<num_layers>;
+    remap the pieces mini models onto model.mtp.*. Whatever stays under
+    layers.<num_layers> afterwards (indexer, the tied shared_head.head, embeds) is
+    dropped by _should_skip_key's layer-index threshold."""
+    prefix = f"model.layers.{num_layers}."
+    if not name.startswith(prefix):
+        return name
+    rest = name[len(prefix) :]
+    if ".indexer" in rest:
+        return name
+    if rest.startswith(("enorm", "hnorm", "eh_proj")):
+        return f"model.mtp.{rest}"
+    if rest.startswith("shared_head.norm"):
+        return "model.mtp.shared_head_norm" + rest[len("shared_head.norm") :]
+    if rest.startswith(("self_attn", "mlp", "input_layernorm", "post_attention_layernorm")):
+        return f"model.mtp.decoder.{rest}"
+    return name
+
+
 def _should_skip_key(name: str, num_layers: int) -> bool:
     """Drop weights not modeled in mini-sglang: the DSA lightning indexer (for
     seq_len <= index_topk attention is dense, so the indexer is unused) and the
@@ -131,6 +151,8 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
                 stripped = name.removeprefix("language_model.")
+                if config.num_nextn > 0:
+                    stripped = _remap_mtp_key(stripped, config.num_layers)
                 # Only the routed experts stay FP8; all other fp8 weights are dequantized to bf16.
                 fp8_keep = is_fp8 and _EXPERT_PATTERN.match(stripped) is not None
                 if name.endswith(_SCALE_SUFFIX):

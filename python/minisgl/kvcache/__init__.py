@@ -40,7 +40,7 @@ def create_kvcache_pool(
         return MLAKVCache(
             kv_lora_rank=model_config.kv_lora_rank,
             qk_rope_head_dim=model_config.qk_rope_head_dim,
-            num_layers=model_config.num_layers,
+            num_layers=model_config.num_layers + model_config.num_nextn,
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
@@ -52,7 +52,7 @@ def create_kvcache_pool(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=model_config.num_layers + model_config.num_nextn,
         head_dim=model_config.head_dim,
         device=device,
         dtype=dtype,

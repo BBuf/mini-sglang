@@ -1,0 +1,281 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+import torch
+from minisgl.core import Batch, Req
+from minisgl.message import DetokenizeMsg
+from minisgl.utils import init_logger
+
+if TYPE_CHECKING:
+    from .scheduler import Scheduler
+
+logger = init_logger(__name__)
+
+
+class _VirtualReq(Req):
+    """A view of a real request at a shifted (cached_len, device_len), sharing its
+    page-table row. Lets speculative verify / draft steps masquerade as ordinary
+    decode batches, so they reuse the captured decode cuda graphs and the normal
+    attention-metadata path (each row attends causally to slots [0, device_len))."""
+
+    def __init__(self, base: Req, cached_len: int, device_len: int):
+        self.input_ids = base.input_ids  # unused by the forward path
+        self.table_idx = base.table_idx
+        self.cached_len = cached_len
+        self.output_len = 1
+        self.uid = base.uid
+        self.sampling_params = base.sampling_params
+        self.cache_handle = base.cache_handle
+        self.device_len = device_len
+        self.max_device_len = device_len + 1
+
+
+@dataclass
+class _SpecState:
+    alloc_len: int  # page-table high-water mark: positions < alloc_len have pages
+    drafts_ready: bool = False
+
+
+class SpecManager:
+    """MTP / NextN speculative decoding (bs=1, greedy).
+
+    Per round: verify the k pending drafts with one graphed decode batch of k+1
+    staggered virtual requests, accept the matching prefix (+1 bonus token), then
+    run the 1-layer MTP draft model to refill k drafts. Draft token values only
+    ever live in token_pool on GPU; the CPU sees just the accepted tokens.
+    """
+
+    def __init__(self, sched: Scheduler, steps: int):
+        self.s = sched
+        self.k = steps
+        self.engine = sched.engine
+        self.device = sched.device
+        self.states: Dict[int, _SpecState] = {}
+        self._rounds = 0
+        self._accepted = 0
+        self._t_verify = 0.0
+        self._t_draft = 0.0
+
+    # ------------------------------------------------------------- helpers ----
+    @property
+    def _token_pool(self) -> torch.Tensor:
+        return self.s.token_pool
+
+    @property
+    def _page_table(self) -> torch.Tensor:
+        return self.engine.page_table
+
+    def _ensure_pages(self, req: Req, need_len: int) -> None:
+        st = self.states[req.uid]
+        if need_len > st.alloc_len:
+            v = _VirtualReq(req, st.alloc_len, need_len)
+            self.s.cache_manager.allocate_paged([v])
+            st.alloc_len = need_len
+
+    def _make_batch(
+        self,
+        req: Req,
+        rows: List[Tuple[int, int]],  # (cached_len, device_len) per row
+        positions: torch.Tensor,  # int32 gpu, attention position per row
+        phase: str,
+        use_graph: bool,
+    ) -> Tuple[Batch, torch.Tensor, torch.Tensor]:
+        batch = Batch(reqs=[_VirtualReq(req, c, d) for c, d in rows], phase=phase)
+        if use_graph:
+            self.engine.graph_runner.pad_batch(batch)
+        else:
+            batch.padded_reqs = batch.reqs
+        pad = batch.padded_size - batch.size
+        if pad > 0:
+            dummy_idx = self.engine.dummy_req.table_idx
+            positions = torch.cat(
+                [positions, torch.zeros(pad, dtype=torch.int32, device=self.device)]
+            )
+            table = torch.tensor(
+                [r.table_idx for r in batch.reqs] + [dummy_idx] * pad,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            table = torch.full(
+                (len(positions),), req.table_idx, dtype=torch.int64, device=self.device
+            )
+        out_pos = positions.to(torch.int64)
+        batch.positions = positions
+        batch.out_loc = self._page_table[(table, out_pos)]
+        self.engine.attn_backend.prepare_metadata(batch)
+        return batch, table, out_pos
+
+    # ------------------------------------------------------------ bootstrap ----
+    def try_bootstrap(self, batch: Batch) -> None:
+        """After an unchunked, prefix-cache-free, single-request prefill: run the
+        MTP layer over the whole prompt to build its KV and produce k drafts."""
+        if len(batch.reqs) != 1:
+            return
+        req = batch.reqs[0]
+        if not req.sampling_params.is_greedy or not req.can_decode:
+            return
+        L = req.device_len - 1  # prompt length (device_len advanced by complete_one)
+        if len(batch.positions) != L:
+            return  # chunked or prefix-cached prefill: no hidden for early rows
+        if req.remain_len <= self.k + 1:
+            return
+        hidden = self.engine.get_last_hidden(batch)[:L]
+        self.states[req.uid] = _SpecState(alloc_len=L)
+        table = req.table_idx
+        self._ensure_pages(req, L + self.k + 1)
+        # rows 0..L-1: input tokens are positions 1..L (prompt shifted + sampled t_L)
+        positions = torch.arange(0, L, dtype=torch.int32, device=self.device)
+        mtp_batch, tbl, out_pos = self._make_batch(req, [(0, L)], positions, "prefill", False)
+        mtp_batch.spec_prev_hidden = hidden
+        input_ids = self._token_pool[(tbl, out_pos + 1)]
+        logits, mtp_hidden = self.engine.forward_mtp_batch(mtp_batch, input_ids)
+        d = torch.argmax(logits[-1:], dim=-1).to(torch.int32)
+        self._token_pool[table, L + 1] = d[0]
+        self._chain_drafts(req, next_pos=L, prev_draft=d, prev_hidden=mtp_hidden[-1:])
+        self.states[req.uid].drafts_ready = True
+
+    def _chain_drafts(
+        self, req: Req, next_pos: int, prev_draft: torch.Tensor, prev_hidden: torch.Tensor
+    ) -> None:
+        """Autoregressive draft steps 2..k through the MTP layer (q=1 each).
+        `next_pos` is the first attention position after the rows already run
+        through the MTP layer. Chained row i (i=1..k-1) sits at position
+        next_pos+i-1, consumes emb(d_i) (== the token at its position+1) plus the
+        previous MTP hidden, and its argmax d_{i+1} lands at token position+2."""
+        table = req.table_idx
+        for i in range(1, self.k):
+            pos = next_pos + i - 1
+            positions = torch.tensor([pos], dtype=torch.int32, device=self.device)
+            b, _, _ = self._make_batch(req, [(pos, pos + 1)], positions, "decode", False)
+            b.spec_prev_hidden = prev_hidden
+            logits, mtp_hidden = self.engine.forward_mtp_batch(b, prev_draft)
+            prev_draft = torch.argmax(logits[:1], dim=-1).to(torch.int32)
+            prev_hidden = mtp_hidden[:1]
+            self._token_pool[table, pos + 2] = prev_draft[0]
+
+    # ---------------------------------------------------------------- round ----
+    def pick_req(self) -> Optional[Req]:
+        running = self.s.decode_manager.running_reqs
+        if len(running) != 1:
+            return None
+        req = next(iter(running))
+        st = self.states.get(req.uid)
+        if st is None or not st.drafts_ready:
+            return None
+        if not req.sampling_params.is_greedy or req.remain_len <= self.k + 1:
+            return None
+        return req
+
+    def run_round(self, req: Req) -> None:
+        import time
+
+        t0 = time.perf_counter()
+        k = self.k
+        D = req.device_len
+        table = req.table_idx
+        self._ensure_pages(req, D + 2 * k + 1)
+
+        # ---- verify: k+1 staggered rows through the normal (graphed) decode path
+        drafts_cpu = self._token_pool[table, D : D + k].cpu()
+        rows = [(D - 1 + i, D + i) for i in range(k + 1)]
+        positions = torch.arange(D - 1, D + k, dtype=torch.int32, device=self.device)
+        batch, tbl, out_pos = self._make_batch(req, rows, positions, "decode", True)
+        batch.input_ids = self._token_pool[(tbl, out_pos)]
+        sample_args = self.engine.sampler.prepare(batch)
+        out = self.engine.forward_batch(batch, sample_args)
+        hidden = self.engine.get_last_hidden(batch)
+
+        # ---- accept the longest matching prefix (+ the bonus prediction)
+        out.copy_done_event.synchronize()
+        t1 = time.perf_counter()
+        preds_cpu = out.next_tokens_cpu[: k + 1]
+        n = 0
+        while n < k and int(preds_cpu[n]) == int(drafts_cpu[n]):
+            n += 1
+        n_new = n + 1  # accepted drafts + bonus
+
+        finished = False
+        accepted = preds_cpu[:n_new]
+        if not req.sampling_params.ignore_eos:
+            eos = (accepted == self.s.eos_token_id).nonzero()
+            if eos.numel() > 0:
+                n_new = int(eos[0, 0]) + 1
+                accepted = accepted[:n_new]
+                finished = True
+        remain = req.max_device_len - D
+        if n_new >= remain:
+            n_new = remain
+            accepted = accepted[:n_new]
+            finished = True
+
+        # publish accepted tokens (idempotent for the matched prefix) + host state
+        self._token_pool[table, D : D + n_new] = out.next_tokens_gpu[:n_new]
+        req.cached_len = D + n_new - 1
+        req.device_len = D + n_new
+        req.append_host(accepted.to(torch.int32))
+
+        self.s.send_result(
+            [
+                DetokenizeMsg(
+                    uid=req.uid,
+                    next_token=int(t),
+                    finished=finished and (i == n_new - 1),
+                )
+                for i, t in enumerate(accepted)
+            ]
+        )
+
+        if finished:
+            self.finish_req(req)
+            return
+
+        # ---- refill drafts: MTP extend over the accepted rows, then chain
+        m = n_new  # rows D-1 .. D-1+m-1 consume tokens D..D+m-1 and hidden rows 0..m-1
+        positions = torch.arange(D - 1, D - 1 + m, dtype=torch.int32, device=self.device)
+        rows = [(D - 1 + i, D + i) for i in range(m)]
+        mtp_batch, tbl, out_pos = self._make_batch(req, rows, positions, "decode", False)
+        mtp_batch.spec_prev_hidden = hidden[:m]
+        input_ids = self._token_pool[(tbl, out_pos + 1)]
+        logits, mtp_hidden = self.engine.forward_mtp_batch(mtp_batch, input_ids)
+        d = torch.argmax(logits[m - 1 : m], dim=-1).to(torch.int32)
+        J = D + n_new - 2  # last accepted main position
+        self._token_pool[table, J + 2] = d[0]
+        self._chain_drafts(req, next_pos=J + 1, prev_draft=d, prev_hidden=mtp_hidden[m - 1 : m])
+
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        self._rounds += 1
+        self._accepted += n_new
+        self._t_verify += t1 - t0
+        self._t_draft += t2 - t1
+        if self._rounds % 50 == 0:
+            logger.info_rank0(
+                f"[spec] rounds={self._rounds} mean_accept={self._accepted / self._rounds:.2f} "
+                f"verify={1e3 * self._t_verify / self._rounds:.2f}ms "
+                f"draft={1e3 * self._t_draft / self._rounds:.2f}ms"
+            )
+
+    # ------------------------------------------------------------- cleanup ----
+    def finish_req(self, req: Req) -> None:
+        st = self.states.pop(req.uid, None)
+        self.s.decode_manager.remove_req(req)
+        self.s._free_req_resources(req)
+        if st is not None and st.alloc_len > req.cached_len:
+            # tail pages beyond what cache_req saw
+            self.s.cache_manager._free(
+                self._page_table[req.table_idx, req.cached_len : st.alloc_len]
+            )
+
+    def drop_req(self, req: Req) -> None:
+        """Called when a spec'd request degrades to the normal decode path (its
+        drafts / hidden chain are gone) or gets aborted. Frees everything from
+        cached_len up: the normal path's allocate_paged re-allocates
+        [cached_len, device_len) itself, so leaving those pages would orphan them."""
+        st = self.states.pop(req.uid, None)
+        if st is not None and st.alloc_len > req.cached_len:
+            self.s.cache_manager._free(
+                self._page_table[req.table_idx, req.cached_len : st.alloc_len]
+            )

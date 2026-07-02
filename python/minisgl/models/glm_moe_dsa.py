@@ -321,16 +321,23 @@ _fused_gate = None
 
 
 def _get_fused_gate():
+    # Newer sglang exports the CUDA kernel as moe_fused_gate_jit, older as
+    # moe_fused_gate (same signature); support both.
     global _fused_gate
     if _fused_gate is None:
         try:
-            from sglang.jit_kernel.moe_fused_gate import (
-                can_use_moe_fused_gate,
-                moe_fused_gate_jit,
-            )
+            import sglang.jit_kernel.moe_fused_gate as _mfg
 
-            _fused_gate = moe_fused_gate_jit if can_use_moe_fused_gate() else False
-        except ImportError:
+            fn = getattr(_mfg, "moe_fused_gate_jit", None) or getattr(_mfg, "moe_fused_gate", None)
+            can_use = getattr(_mfg, "can_use_moe_fused_gate", None)
+            if fn is None:
+                _fused_gate = False
+            elif can_use is not None:
+                _fused_gate = fn if can_use() else False
+            else:
+                _mfg._jit_moe_fused_gate_module()  # force JIT compile; raises if broken
+                _fused_gate = fn
+        except Exception:
             _fused_gate = False
     return _fused_gate
 
@@ -468,12 +475,37 @@ class GlmMoeDsaDecoderLayer(BaseOP):
         return x, residual
 
 
+class GlmMoeDsaMTP(BaseOP):
+    """MTP / NextN draft layer (checkpoint layer index == num_layers): predicts
+    token i+2 from token i+1's embedding and token i's pre-final-norm hidden.
+    eh_proj(cat(enorm(emb), hnorm(prev_hidden))) -> decoder (MLA+MoE, own KV slot)
+    -> shared_head norm; logits come from the shared main lm_head."""
+
+    def __init__(self, config: ModelConfig):
+        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = LinearReplicated(2 * config.hidden_size, config.hidden_size, has_bias=False)
+        self.decoder = GlmMoeDsaDecoderLayer(config, config.num_layers)
+        self.shared_head_norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self, emb: torch.Tensor, prev_hidden: torch.Tensor, cos, sin
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.eh_proj.forward(
+            torch.cat([self.enorm.forward(emb), self.hnorm.forward(prev_hidden)], dim=-1)
+        )
+        x, residual = self.decoder.forward(h, cos, sin, None)
+        return self.shared_head_norm.forward(x, residual)  # (normed, residual)
+
+
 class GlmMoeDsaModel(BaseOP):
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = OPList(
             [GlmMoeDsaDecoderLayer(config, i) for i in range(config.num_layers)]
         )
+        self.mtp = GlmMoeDsaMTP(config) if config.num_nextn > 0 else None
+        self._last_hidden: torch.Tensor | None = None  # pre-norm residual, for MTP
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self._rope_dim = config.qk_rope_head_dim
         self._rope_base = float(config.rotary_config.base)
@@ -500,18 +532,20 @@ class GlmMoeDsaModel(BaseOP):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
-        positions = get_global_ctx().batch.positions
-        if _get_fused_rope(self._rope_dim, torch.bfloat16):
-            # Fused rope: pass the cache via the `cos` slot with sin=None as the
-            # sentinel; each layer runs one CUDA kernel off positions + cache.
-            cos, sin = self._rope_cache(positions.device), None
-        else:
-            # RoPE cos/sin computed ONCE per forward, shared across all layers.
-            cos, sin = _rope_cos_sin(positions, self._rope_dim, self._rope_base)
+        # Fused rope passes the fp32 cache via the `cos` slot with sin=None as the
+        # sentinel; the python fallback gets per-forward cos/sin instead.
+        cos, sin = self.rope_args(input_ids.device)
         residual = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, cos, sin, residual)
-        return self.norm.forward(x, residual)[0]
+        out, self._last_hidden = self.norm.forward(x, residual)
+        return out
+
+    def rope_args(self, device: torch.device):
+        if _get_fused_rope(self._rope_dim, torch.bfloat16):
+            return self._rope_cache(device), None
+        positions = get_global_ctx().batch.positions
+        return _rope_cos_sin(positions, self._rope_dim, self._rope_base)
 
 
 class GlmMoeDsaForCausalLM(BaseLLMModel):
@@ -528,6 +562,17 @@ class GlmMoeDsaForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
+
+    def forward_mtp(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run only the MTP/NextN draft layer. Reads input_ids (the NEXT-position
+        tokens) and spec_prev_hidden from the active batch; returns (logits, the
+        draft layer's pre-norm residual for chaining further draft steps)."""
+        batch = get_global_ctx().batch
+        model = self.model
+        emb = model.embed_tokens.forward(batch.input_ids)
+        cos, sin = model.rope_args(batch.input_ids.device)
+        normed, hidden = model.mtp.forward(emb, batch.spec_prev_hidden, cos, sin)
+        return self.lm_head.forward(normed), hidden
 
 
 __all__ = ["GlmMoeDsaForCausalLM"]

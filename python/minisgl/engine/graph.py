@@ -104,6 +104,8 @@ class GraphRunner:
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        # bs -> the model's pre-final-norm hidden buffer inside that graph (for MTP)
+        self.hidden_map: Dict[int, torch.Tensor] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -142,6 +144,9 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+            hidden = getattr(getattr(model, "model", None), "_last_hidden", None)
+            if hidden is not None:
+                self.hidden_map[bs] = hidden
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
