@@ -193,6 +193,18 @@ class GlmMLAAttention(BaseOP):
         self.o_proj = _orow(config, num_heads * self.v_head_dim, config.hidden_size)
         self.w_kc = None  # absorbed W_UK [H,qk_nope,kv_lora], built lazily on first forward
         self.w_vc = None  # absorbed W_UV^T [H,kv_lora,v_head]
+        self._qkv_a_weight = None  # fused [q_a; kv_a] weight, built lazily on first forward
+
+    def _fuse_qkv_a(self) -> None:
+        # q_a_proj and kv_a_proj_with_mqa are both replicated GEMMs over the same
+        # input; fuse their weights so one GEMM (and one read of x) replaces two.
+        # Built lazily (after weight load, before cuda-graph capture); the original
+        # op weights become views into the fused buffer so nothing is duplicated.
+        wq = self.q_a_proj.weight
+        wkv = self.kv_a_proj_with_mqa.weight
+        self._qkv_a_weight = torch.cat([wq, wkv], dim=0).contiguous()
+        self.q_a_proj.weight = self._qkv_a_weight[: wq.shape[0]]
+        self.kv_a_proj_with_mqa.weight = self._qkv_a_weight[wq.shape[0] :]
 
     def _apply_rope(self, q_pe, k_pe, cos, sin):
         # GLM-5.2 uses INTERLEAVED (GPT-J) RoPE (config rope_interleave=true ->
@@ -219,12 +231,17 @@ class GlmMLAAttention(BaseOP):
         T = x.shape[0]
         backend = ctx.attn_backend
 
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x)))
+        if self._qkv_a_weight is None:
+            self._fuse_qkv_a()
+        qkv_a = F.linear(x, self._qkv_a_weight)
+        q_a, k_compressed, k_pe = qkv_a.split(
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(q_a.contiguous()))
         q = q.view(T, self.local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        ckv_all = self.kv_a_proj_with_mqa.forward(x)
-        k_compressed, k_pe = ckv_all.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_compressed = self.kv_a_layernorm.forward(k_compressed.contiguous())
 
         k_pe = k_pe.reshape(T, 1, self.qk_rope_head_dim)
@@ -387,7 +404,11 @@ class GlmSparseMoE(BaseOP):
         num_tokens, hidden_dim = x.shape
         x = x.view(-1, hidden_dim)
         topk_ids, topk_w = self._route(self.gate.forward(x))
-        shared = self.shared_experts.forward(x)
+        # Shared-expert partial WITHOUT its row-parallel all-reduce: since
+        # all-reduce is linear, summing routed+shared partials first and reducing
+        # once is equivalent and saves one all-reduce per MoE layer.
+        se = self.shared_experts
+        shared = F.linear(se.act_fn(se.gate_up_proj.forward(x)), se.down_proj.weight)
 
         if self.is_fp8:
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts_impl
@@ -416,9 +437,10 @@ class GlmSparseMoE(BaseOP):
                 activation="silu",
                 apply_router_weight_on_input=False,
             )
+        out = routed + shared
         if self._tp > 1:
-            routed = self._comm.all_reduce(routed)
-        return (routed + shared).view(num_tokens, hidden_dim)
+            out = self._comm.all_reduce(out)
+        return out.view(num_tokens, hidden_dim)
 
 
 class GlmMoeDsaDecoderLayer(BaseOP):
