@@ -52,6 +52,10 @@ def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
+# MTP draft hidden source A/B: "pre" (pre-final-norm residual, DeepSeek paper
+# convention, default) vs "post" (post-norm output)
+_MTP_HIDDEN_POST = os.environ.get("MINISGL_MTP_HIDDEN", "pre") == "post"
+
 _fused_rope = None
 
 
@@ -431,7 +435,9 @@ class GlmSparseMoE(BaseOP):
     def __init__(self, config: ModelConfig, quantized: bool = True):
         tp = get_tp_info().size
         self.gate = GlmMoeGate(config)
-        self.is_fp8 = config.is_fp8 and quantized
+        # fp8 checkpoints quantize every layer's experts (incl. MTP); modelopt
+        # NVFP4 leaves the MTP layer's experts bf16, so only fp4 keys off `quantized`
+        self.is_fp8 = config.is_fp8
         self.is_fp4 = config.is_fp4 and quantized
         self._fp4 = None  # trtllm-shuffled weights + alphas, built on first forward
         self._mtp_fp4_pending = (
@@ -443,7 +449,7 @@ class GlmSparseMoE(BaseOP):
             self.experts = Fp4Experts(
                 config.num_experts, config.hidden_size, div_even(config.moe_intermediate_size, tp)
             )
-        elif config.is_fp8 and quantized:
+        elif config.is_fp8:
             self.experts = Fp8Experts(
                 config.num_experts, config.hidden_size, div_even(config.moe_intermediate_size, tp)
             )
@@ -707,7 +713,8 @@ class GlmMoeDsaMTP(BaseOP):
             torch.cat([self.enorm.forward(emb), self.hnorm.forward(prev_hidden)], dim=-1)
         )
         x, residual = self.decoder.forward(h, cos, sin, None)
-        return self.shared_head_norm.forward(x, residual)  # (normed, residual)
+        normed, residual = self.shared_head_norm.forward(x, residual)
+        return normed, (normed if _MTP_HIDDEN_POST else residual)
 
 
 class GlmMoeDsaModel(BaseOP):
@@ -751,6 +758,8 @@ class GlmMoeDsaModel(BaseOP):
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, cos, sin, residual)
         out, self._last_hidden = self.norm.forward(x, residual)
+        if _MTP_HIDDEN_POST:
+            self._last_hidden = out
         return out
 
     def rope_args(self, device: torch.device):
