@@ -264,7 +264,41 @@ class Fp8Experts(BaseOP):
         )
 
 
+_fused_gate = None
+
+
+def _get_fused_gate():
+    global _fused_gate
+    if _fused_gate is None:
+        try:
+            from sglang.jit_kernel.moe_fused_gate import (
+                can_use_moe_fused_gate,
+                moe_fused_gate_jit,
+            )
+
+            _fused_gate = moe_fused_gate_jit if can_use_moe_fused_gate() else False
+        except ImportError:
+            _fused_gate = False
+    return _fused_gate
+
+
 def _moe_route(self, router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    if self.n_group == 1 and router_logits.dtype == torch.float32:
+        # sglang's CUDA jit_kernel replaces the whole sigmoid/+bias/top-k/gather/
+        # renorm/scale chain (~7 kernels, 15.8us) with one kernel (4.3us/layer,
+        # cuda-graph timed). Weights match the python path to 1 ULP (bit-exact at
+        # bs=1); ids identical.
+        fused_gate = _get_fused_gate()
+        if fused_gate:
+            topk_w, topk_ids = fused_gate(
+                router_logits,
+                self.gate.e_score_correction_bias,
+                self.top_k,
+                renormalize=self.norm_topk_prob,
+                routed_scaling_factor=self.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=True,
+            )
+            return topk_ids, topk_w
     scores = router_logits.sigmoid()
     scores_for_choice = scores + self.gate.e_score_correction_bias.to(torch.float32)
     E, g = self.num_experts, self.n_group
