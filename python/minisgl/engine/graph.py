@@ -51,6 +51,11 @@ def _determine_cuda_graph_bs(
     cuda_graph_max_bs: int | None,
     free_memory: int,
 ) -> List[int]:
+    import os
+
+    env = os.environ.get("MINISGL_GRAPH_BS")
+    if env:  # e.g. "1,2,4,5,8" — lets speculative k+1 hit an exact graph size
+        return sorted(int(x) for x in env.split(","))
     if cuda_graph_bs is not None:
         return cuda_graph_bs
 
