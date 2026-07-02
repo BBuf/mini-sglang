@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -28,6 +29,14 @@ if TYPE_CHECKING:
 
 _FP8 = torch.float8_e4m3fn
 _BLOCK = [128, 128]
+
+# sglang's triton fused_moe resolves tuned tile configs from
+# $SGLANG_MOE_CONFIG_DIR/configs/triton_<ver>/<shape>.json; point it at the
+# configs shipped in minisgl/moe (setdefault keeps user overrides working).
+os.environ.setdefault(
+    "SGLANG_MOE_CONFIG_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "moe"),
+)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
