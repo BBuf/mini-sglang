@@ -259,13 +259,19 @@ def _moe_route(self, router_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.T
     scores = router_logits.sigmoid()
     scores_for_choice = scores + self.gate.e_score_correction_bias.to(torch.float32)
     E, g = self.num_experts, self.n_group
-    group_scores = scores_for_choice.view(-1, g, E // g).topk(2, dim=-1)[0].sum(dim=-1)
-    group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1)
-    score_mask = group_mask.unsqueeze(-1).expand(-1, g, E // g).reshape(-1, E)
-    masked = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
-    topk_ids = torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
+    if g == 1:
+        # n_group==1 (GLM-5.2): grouped-topk degenerates to plain top-k over all experts.
+        # Skip the no-op group machinery (view/topk2/sum/topk/scatter/expand/masked_fill,
+        # ~8 tiny kernels/layer) — bit-identical result, big kernel-count cut at bs=1.
+        topk_ids = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+    else:
+        group_scores = scores_for_choice.view(-1, g, E // g).topk(2, dim=-1)[0].sum(dim=-1)
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = group_mask.unsqueeze(-1).expand(-1, g, E // g).reshape(-1, E)
+        masked = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        topk_ids = torch.topk(masked, k=self.top_k, dim=-1, sorted=False)[1]
     topk_w = scores.gather(1, topk_ids)
     if self.norm_topk_prob:
         topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + 1e-20)
