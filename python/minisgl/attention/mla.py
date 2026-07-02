@@ -179,7 +179,9 @@ class MLABackend(BaseAttnBackend):
         self._plan_once(metadata)
         ckv_cache = self.kvcache.ckv_cache(layer_id)  # [num_pages, page_size, ckv_dim]
         kpe_cache = self.kvcache.kpe_cache(layer_id)  # [num_pages, page_size, kpe_dim]
-        return metadata.wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache)
+        return metadata.wrapper.run(
+            q_nope.contiguous(), q_pe.contiguous(), ckv_cache, kpe_cache
+        )
 
     def _block_tables_for(self, batch: Batch) -> torch.Tensor:
         # page-aligned allocation guarantees page_table[t, k*ps] is a page start

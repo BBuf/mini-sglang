@@ -242,19 +242,17 @@ class GlmMLAAttention(BaseOP):
             [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
 
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(q_a.contiguous()))
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(q_a))
         q = q.view(T, self.local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        k_compressed = self.kv_a_layernorm.forward(k_compressed.contiguous())
+        k_compressed = self.kv_a_layernorm.forward(k_compressed)
 
         k_pe = k_pe.reshape(T, 1, self.qk_rope_head_dim)
         if sin is None:
             # Fused-rope mode: `cos` carries the fp32 [max_pos, rope_dim] cos/sin
-            # cache (see GlmMoeDsaModel.forward). In-place CUDA kernel; the
-            # .contiguous() copies were needed downstream anyway.
-            q_pe = q_pe.contiguous()
-            k_pe = k_pe.contiguous()
+            # cache (see GlmMoeDsaModel.forward). The kernel rotates the strided
+            # q/k slices in place — no contiguous copies needed.
             _get_fused_rope(self.qk_rope_head_dim, q_pe.dtype)(
                 q_pe, k_pe, cos, ctx.batch.positions, is_neox=False
             )
@@ -265,12 +263,17 @@ class GlmMLAAttention(BaseOP):
             # ---- absorbed MLA: attention in the kv_lora latent space ----
             if self.w_kc is None:
                 self._build_absorb_weights()
-            q_nope_latent = torch.einsum("thn,hnl->thl", q_nope.to(self.w_kc.dtype), self.w_kc)
+            # bmm on transposed VIEWS: cublas strided-batch takes the layouts
+            # directly, killing the einsum's permute materializations; the
+            # downstream concat/store kernels all accept strided inputs.
+            q_nope_latent = torch.bmm(
+                q_nope.to(self.w_kc.dtype).transpose(0, 1), self.w_kc
+            ).transpose(0, 1)
             o_latent = backend.forward_mla(
-                q_nope_latent.contiguous(),
-                q_pe.contiguous(),
+                q_nope_latent,
+                q_pe,
                 k_compressed,
-                k_pe.squeeze(1).contiguous(),
+                k_pe.squeeze(1),
                 self.layer_id,
                 ctx.batch,
             )  # [T,H,kv_lora]
