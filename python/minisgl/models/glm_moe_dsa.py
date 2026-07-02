@@ -349,6 +349,20 @@ _last_fp4_act_scales = {}
 _trtllm_moe_ok = None
 
 
+_IN_MTP = False
+
+
+def _use_custom_moe() -> bool:
+    mode = os.environ.get("MINISGL_CUSTOM_MOE", "mtp")
+    if mode == "1":
+        return True
+    if mode == "verify":  # custom kernel only in the main model
+        return not _IN_MTP
+    if mode == "mtp":  # custom kernel only in the MTP draft layer
+        return _IN_MTP
+    return False
+
+
 def _use_trtllm_moe() -> bool:
     # flashinfer's trtllm-gen fused MoE (opt-in via MINISGL_TRTLLM_MOE=1).
     # Measured on 8xB300 vs the tuned triton path: only ~38us vs ~47us per layer
@@ -639,6 +653,45 @@ class GlmSparseMoE(BaseOP):
             routed = self._trtllm_fp4_moe(x.contiguous(), router_logits)
         elif self.is_fp8 and _use_trtllm_moe():
             routed = self._trtllm_moe(x.contiguous(), router_logits)
+        elif self.is_fp8 and _use_custom_moe() and num_tokens <= 16:
+            from minisgl.kernel.moe_decode import moe_decode
+
+            topk_ids, topk_w = self._route(router_logits)
+            routed = moe_decode(
+                x.contiguous(),
+                self.experts.gate_up_proj,
+                self.experts.gate_up_proj_scale_inv,
+                self.experts.down_proj,
+                self.experts.down_proj_scale_inv,
+                topk_ids,
+                topk_w,
+            )
+            if os.environ.get("MINISGL_MOE_XCHECK", "0") == "1" and not torch.cuda.is_current_stream_capturing():
+                from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+                    fused_experts_impl,
+                )
+
+                ref = fused_experts_impl(
+                    x.contiguous(),
+                    self.experts.gate_up_proj,
+                    self.experts.down_proj,
+                    topk_w,
+                    topk_ids,
+                    inplace=False,
+                    use_fp8_w8a8=True,
+                    w1_scale=self.experts.gate_up_proj_scale_inv,
+                    w2_scale=self.experts.down_proj_scale_inv,
+                    block_shape=_BLOCK,
+                )
+                rel = (routed.float() - ref.float()).abs().max() / (
+                    ref.float().abs().max() + 1e-9
+                )
+                from minisgl.utils import init_logger
+
+                init_logger(__name__).info_rank0(
+                    f"[xcheck] M={num_tokens} rel={rel.item():.3e} "
+                    f"|mine|={routed.float().abs().max().item():.3e} |ref|={ref.float().abs().max().item():.3e}"
+                )
         elif self.is_fp8:
             from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts_impl
 
@@ -712,11 +765,16 @@ class GlmMoeDsaMTP(BaseOP):
     def forward(
         self, emb: torch.Tensor, prev_hidden: torch.Tensor, cos, sin
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.eh_proj.forward(
-            torch.cat([self.enorm.forward(emb), self.hnorm.forward(prev_hidden)], dim=-1)
-        )
-        x, residual = self.decoder.forward(h, cos, sin, None)
-        normed, residual = self.shared_head_norm.forward(x, residual)
+        global _IN_MTP
+        _IN_MTP = True
+        try:
+            h = self.eh_proj.forward(
+                torch.cat([self.enorm.forward(emb), self.hnorm.forward(prev_hidden)], dim=-1)
+            )
+            x, residual = self.decoder.forward(h, cos, sin, None)
+            normed, residual = self.shared_head_norm.forward(x, residual)
+        finally:
+            _IN_MTP = False
         return normed, (normed if _MTP_HIDDEN_POST else residual)
 
 
