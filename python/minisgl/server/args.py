@@ -223,8 +223,56 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    # Speculative decoding (MTP/NextN), flag-compatible with the sglang
+    # GLM-5.2 cookbook: EAGLE topk=1 chain drafts verified as one decode
+    # batch. Defaults mirror the cookbook (5 steps, 6 draft tokens).
+    parser.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        default=None,
+        choices=["EAGLE", "NEXTN"],
+        help="Enable MTP speculative decoding (EAGLE and NEXTN are the same "
+        "topk-1 chain draft in minisgl).",
+    )
+    parser.add_argument(
+        "--speculative-num-steps",
+        type=int,
+        default=5,
+        help="Number of chained draft steps (k).",
+    )
+    parser.add_argument(
+        "--speculative-eagle-topk",
+        type=int,
+        default=1,
+        help="Draft tree width; minisgl only supports 1.",
+    )
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        default=6,
+        help="Verify batch size; must equal num-steps + 1.",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+
+    # resolve speculative-decoding flags into the env knobs the scheduler and
+    # graph runner read; setdefault keeps explicit MINISGL_* overrides working
+    spec_algo = kwargs.pop("speculative_algorithm")
+    spec_steps = kwargs.pop("speculative_num_steps")
+    spec_topk = kwargs.pop("speculative_eagle_topk")
+    spec_draft = kwargs.pop("speculative_num_draft_tokens")
+    if spec_algo is not None:
+        assert spec_topk == 1, "minisgl MTP chain drafts are topk=1 only"
+        assert (
+            spec_draft == spec_steps + 1
+        ), "verify-as-decode requires num-draft-tokens == num-steps + 1"
+        os.environ.setdefault("MINISGL_SPEC_STEPS", str(spec_steps))
+        os.environ.setdefault(
+            "MINISGL_GRAPH_BS", ",".join(str(i) for i in range(1, spec_draft + 1))
+        )
+        os.environ.setdefault("MINISGL_MTP_HIDDEN", "post")
+        kwargs["cuda_graph_max_bs"] = max(kwargs["cuda_graph_max_bs"] or 0, spec_draft)
 
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
