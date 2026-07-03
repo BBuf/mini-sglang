@@ -96,11 +96,27 @@ class MLABackend(BaseAttnBackend):
             and self.page_size in (32, 64)
             and hasattr(self.kvcache, "combined_cache")
         )
+        # MINISGL_MLA_DECODE picks the decode kernel family explicitly:
+        #   trtllm | xqa (same call shape, different cubins/numerics) | fi
+        decode_mode = os.environ.get("MINISGL_MLA_DECODE", "")
+        if decode_mode == "xqa":
+            self.use_trtllm_decode = self.page_size in (32, 64) and hasattr(
+                self.kvcache, "combined_cache"
+            )
+        elif decode_mode == "fi":
+            self.use_trtllm_decode = False
         if self.use_trtllm_decode:
             try:
-                from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+                if decode_mode == "xqa":
+                    from flashinfer.decode import (
+                        xqa_batch_decode_with_kv_cache_mla as _decode_fn,
+                    )
+                else:
+                    from flashinfer.decode import (
+                        trtllm_batch_decode_with_kv_cache_mla as _decode_fn,
+                    )
 
-                self._trtllm_decode = trtllm_batch_decode_with_kv_cache_mla
+                self._trtllm_decode = _decode_fn
                 # trtllm-gen sizes its split-k partials by bs x max_seq_len; the
                 # shared 128MB flashinfer workspace is too small at engine limits
                 self.trtllm_workspace = torch.empty(

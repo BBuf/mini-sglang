@@ -88,6 +88,11 @@ class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        from minisgl.distributed.fused_ar import plain_ar_or_none
+
+        y = plain_ar_or_none(x)
+        if y is not None:
+            return y
         return self.plugins[-1].all_reduce(x)
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:

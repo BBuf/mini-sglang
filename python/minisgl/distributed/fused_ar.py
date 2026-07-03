@@ -29,6 +29,7 @@ class FusedARNorm:
         self.hidden = hidden
         self._fn = trtllm_allreduce_fusion
         self._pattern = AllReduceFusionPattern.kARResidualRMSNorm
+        self._pattern_ar = AllReduceFusionPattern.kAllReduce
         self.ipc_handles, self.workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
             tp_rank, tp_size, max_tokens, hidden, use_fp32_lamport=False, group=group
         )
@@ -64,12 +65,44 @@ class FusedARNorm:
         return norm_out, residual_out
 
 
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """Plain one-shot AR (no fused norm): isolates the reduction-algorithm
+        swap from the norm-kernel swap; NCCL on this fleet is ~58us/call
+        in-graph while the one-shot kernel is ~15us at decode sizes."""
+        out = torch.empty_like(x)
+        self._fn(
+            allreduce_in=x,
+            world_size=self.tp,
+            world_rank=self.rank,
+            token_num=x.shape[0],
+            hidden_dim=x.shape[1],
+            workspace_ptrs=self.workspace,
+            launch_with_pdl=True,
+            trigger_completion_at_end=True,
+            fp32_acc=os.environ.get("MINISGL_FUSED_AR_FP32", "1") == "1",
+            pattern_code=self._pattern_ar,
+            use_oneshot=True,
+            allreduce_out=out,
+            residual_in=None,
+            residual_out=None,
+            norm_out=None,
+            quant_out=None,
+            scale_out=None,
+            rms_gamma=None,
+            rms_eps=None,
+            scale_factor=None,
+            layout_code=None,
+        )
+        return out
+
+
 def init_fused_ar(tp_info: "DistributedInfo", group, hidden: int) -> None:
     global _FUSED
     # default OFF: measured on B200/fp4/fi-MLA it cuts the round 17.2 -> 15.5ms
     # but the AR numerics-style change collapses deep-chain accept 4.37 -> 3.40
     # (fp32_acc; bf16 acc 3.10) - net negative. Retest on B300 worlds.
-    if tp_info.size <= 1 or os.environ.get("MINISGL_FUSED_AR", "0") != "1":
+    mode = os.environ.get("MINISGL_FUSED_AR", "0")
+    if tp_info.size <= 1 or mode not in ("1", "ar"):
         return
     try:
         max_tokens = int(os.environ.get("MINISGL_FUSED_AR_MAX_TOKENS", "64"))
@@ -87,10 +120,28 @@ def get_fused_ar() -> Optional[FusedARNorm]:
 
 def set_fused_pass(num_tokens: int) -> bool:
     """Called at the top of a model forward; returns whether this pass runs
-    with row-parallel ARs deferred into the fused AR+norm calls."""
+    with row-parallel ARs deferred into the fused AR+norm calls. In plain-AR
+    mode (MINISGL_FUSED_AR=ar) the pass flag stays off: the norm sites keep
+    their kernels and DistributedCommunicator swaps just the reduction."""
     global _PASS_ACTIVE
-    _PASS_ACTIVE = _FUSED is not None and num_tokens <= _FUSED.max_tokens
+    _PASS_ACTIVE = (
+        _FUSED is not None
+        and os.environ.get("MINISGL_FUSED_AR", "0") == "1"
+        and num_tokens <= _FUSED.max_tokens
+    )
     return _PASS_ACTIVE
+
+
+def plain_ar_or_none(x: torch.Tensor) -> Optional[torch.Tensor]:
+    if (
+        _FUSED is not None
+        and os.environ.get("MINISGL_FUSED_AR", "0") == "ar"
+        and x.dim() == 2
+        and x.shape[0] <= _FUSED.max_tokens
+        and x.shape[1] == _FUSED.hidden
+    ):
+        return _FUSED.all_reduce(x)
+    return None
 
 
 def fused_pass_active() -> bool:
