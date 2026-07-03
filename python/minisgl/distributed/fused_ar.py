@@ -101,7 +101,13 @@ def init_fused_ar(tp_info: "DistributedInfo", group, hidden: int) -> None:
     # default OFF: measured on B200/fp4/fi-MLA it cuts the round 17.2 -> 15.5ms
     # but the AR numerics-style change collapses deep-chain accept 4.37 -> 3.40
     # (fp32_acc; bf16 acc 3.10) - net negative. Retest on B300 worlds.
-    mode = os.environ.get("MINISGL_FUSED_AR", "0")
+    # default ON in full-fused mode: large-sample GSM wall-clock (60 ex,
+    # ~60K tok/side) is ~6% faster (216-220s vs 233s NCCL) at neutral accept
+    # (4.51 vs 4.55 over 13k+ rounds). The morning's "AR collapses accept"
+    # was a 200-round small-sample artifact. Note the win is modest because
+    # NCCL AR mostly overlaps compute (41% of summed GPU time but not the
+    # serial critical path). Off with MINISGL_FUSED_AR=0.
+    mode = os.environ.get("MINISGL_FUSED_AR", "1")
     if tp_info.size <= 1 or mode not in ("1", "ar"):
         return
     try:
@@ -126,7 +132,7 @@ def set_fused_pass(num_tokens: int) -> bool:
     global _PASS_ACTIVE
     _PASS_ACTIVE = (
         _FUSED is not None
-        and os.environ.get("MINISGL_FUSED_AR", "0") == "1"
+        and os.environ.get("MINISGL_FUSED_AR", "1") == "1"
         and num_tokens <= _FUSED.max_tokens
     )
     return _PASS_ACTIVE

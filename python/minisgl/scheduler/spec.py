@@ -67,6 +67,19 @@ class SpecManager:
         self._drafts_gpu = torch.empty(steps, dtype=torch.int32, device=self.device)
         self._chain_pos_buf = torch.empty(1, dtype=torch.int32, device=self.device)
         CPU = {"dtype": torch.int32, "pin_memory": True}
+        # teacher-forcing: publish tokens from a fixed reference trajectory
+        # while measuring accept as-if the model were on that trajectory
+        # (MINISGL_FORCE_FILE = json list of generated-token ids)
+        self._force_ids = None
+        self._force_base = None
+        if (ff := os.environ.get("MINISGL_FORCE_FILE")) is not None:
+            import json
+
+            self._force_ids = json.load(open(ff))
+            self._f_rounds = 0
+            self._f_accept = 0
+            self._f_hist = [0] * (steps + 2)
+            self._f_draft_hits = [0] * steps
         self._pin_pos = torch.empty(max(steps - 1, 1), **CPU)
         self._pin_seq = torch.empty(max(steps - 1, 1), **CPU)
         self._pin_tok = torch.empty(steps, dtype=torch.int64, pin_memory=True)
@@ -243,10 +256,46 @@ class SpecManager:
             accepted = accepted[:n_new]
             finished = True
 
+        if self._force_ids is not None:
+            ref = self._force_ids
+            if self._force_base is None:
+                self._force_base = D - 1  # pool[D] <-> ref[1]; ref[0] seam at prefill token
+            idx = D - self._force_base
+            avail = len(ref) - idx
+            self._f_rounds += 1
+            self._f_accept += n_new
+            self._f_hist[min(n_new, k + 1)] += 1
+            for i in range(min(k, max(avail, 0))):
+                self._f_draft_hits[i] += int(int(drafts_cpu[i]) == ref[idx + i])
+            if self._f_rounds % 50 == 0:
+                tot = self._f_rounds
+                logger.info_rank0(
+                    f"[force] rounds={tot} accept_on_ref={self._f_accept / tot:.2f} "
+                    f"hist={self._f_hist} "
+                    f"draft_hit={[round(h / tot, 3) for h in self._f_draft_hits]}"
+                )
+            if avail <= 0:
+                finished = True
+                n_new = 1
+                accepted = preds_cpu[:1]
+            else:
+                n_new = min(k + 1, req.max_device_len - D, avail)
+                accepted = torch.tensor(
+                    ref[idx : idx + n_new], dtype=preds_cpu.dtype
+                )
+                finished = avail <= k + 1
+                req.cached_len = D + n_new - 1
+                req.device_len = D + n_new
+
         # publish accepted tokens (idempotent for the matched prefix); the host
         # bookkeeping (append/detok/send) happens AFTER the draft phase is
         # launched so it overlaps the draft GPU work
-        self._token_pool[table, D : D + n_new] = out.next_tokens_gpu[:n_new]
+        if self._force_ids is not None:
+            self._token_pool[table, D : D + n_new] = accepted.to(
+                self._token_pool.device
+            )
+        else:
+            self._token_pool[table, D : D + n_new] = out.next_tokens_gpu[:n_new]
         req.cached_len = D + n_new - 1
         req.device_len = D + n_new
 
