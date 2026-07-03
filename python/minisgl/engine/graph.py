@@ -180,7 +180,11 @@ class GraphRunner:
         mtp = getattr(getattr(model, "model", None), "mtp", None)
         if mtp is None:
             return
-        bs_list = [bs for bs in self.graph_bs_list if bs <= spec_steps + 1]
+        import os as _os
+        _skip = int(_os.environ.get("MINISGL_MTP_SKIP_BS", "0"))
+        bs_list = [
+            bs for bs in self.graph_bs_list if bs <= spec_steps + 2 and bs != _skip
+        ]
         if not bs_list:
             return
         max_bs = max(bs_list)

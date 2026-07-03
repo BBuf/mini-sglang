@@ -219,6 +219,11 @@ class SpecManager:
         out.copy_done_event.synchronize()
         self._drafts_event.synchronize()  # ordered earlier on the stream: ~free
         preds_cpu = out.next_tokens_cpu[: k + 1]
+        if self._log_stats and self._rounds < 30:
+            logger.info_rank0(
+                f"[specdbg] r={self._rounds} D={D} drafts={drafts_cpu[:k].tolist()} "
+                f"preds={preds_cpu.tolist()}"
+            )
         n = 0
         while n < k and int(preds_cpu[n]) == int(drafts_cpu[n]):
             n += 1
