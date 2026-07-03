@@ -7,6 +7,9 @@ import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.distributed import fused_pass_active as _fused_pass_active
+from minisgl.distributed import get_fused_ar as _get_fused_ar
+from minisgl.distributed import set_fused_pass as _set_fused_pass
 from minisgl.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -132,8 +135,12 @@ class Fp8LinearRow(BaseOP):
         self._tp = tp
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from minisgl.distributed import fused_pass_active
+
         y = _fp8_linear(x, self.weight, self.weight_scale_inv)
-        return self._comm.all_reduce(y) if self._tp > 1 else y
+        if self._tp > 1 and not fused_pass_active():
+            y = self._comm.all_reduce(y)
+        return y
 
 
 # Only the routed experts (the ~96% of params) stay FP8; the MLA / dense / shared-expert
@@ -718,7 +725,7 @@ class GlmSparseMoE(BaseOP):
                 topk_ids,
                 shared,
             )
-            if self._tp > 1:
+            if self._tp > 1 and not _fused_pass_active():
                 out = self._comm.all_reduce(out)
             return out.view(num_tokens, hidden_dim)
         elif self.is_fp8:
@@ -751,7 +758,7 @@ class GlmSparseMoE(BaseOP):
                 apply_router_weight_on_input=False,
             )
         out = routed + shared
-        if self._tp > 1:
+        if self._tp > 1 and not _fused_pass_active():
             out = self._comm.all_reduce(out)
         return out.view(num_tokens, hidden_dim)
 
@@ -771,9 +778,23 @@ class GlmMoeDsaDecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, x, cos, sin, residual=None):
-        x, residual = self.input_layernorm.forward(x, residual)
+        # In fused-AR passes, x arrives as this rank's PARTIAL sum (the row-
+        # parallel projections skip their all-reduce) and each norm site does
+        # AR + residual-add + RMSNorm in one flashinfer kernel.
+        if residual is not None and _fused_pass_active():
+            x, residual = _get_fused_ar().ar_add_rmsnorm(
+                x, residual, self.input_layernorm.weight, self.input_layernorm.eps
+            )
+        else:
+            x, residual = self.input_layernorm.forward(x, residual)
         x = self.self_attn.forward(x, cos, sin)
-        x, residual = self.post_attention_layernorm.forward(x, residual)
+        if _fused_pass_active():
+            x, residual = _get_fused_ar().ar_add_rmsnorm(
+                x, residual, self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+        else:
+            x, residual = self.post_attention_layernorm.forward(x, residual)
         x = self.mlp.forward(x)
         return x, residual
 
@@ -796,12 +817,18 @@ class GlmMoeDsaMTP(BaseOP):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         global _IN_MTP
         _IN_MTP = True
+        _set_fused_pass(emb.shape[0])
         try:
             h = self.eh_proj.forward(
                 torch.cat([self.enorm.forward(emb), self.hnorm.forward(prev_hidden)], dim=-1)
             )
             x, residual = self.decoder.forward(h, cos, sin, None)
-            normed, residual = self.shared_head_norm.forward(x, residual)
+            if _fused_pass_active():
+                normed, residual = _get_fused_ar().ar_add_rmsnorm(
+                    x, residual, self.shared_head_norm.weight, self.shared_head_norm.eps
+                )
+            else:
+                normed, residual = self.shared_head_norm.forward(x, residual)
         finally:
             _IN_MTP = False
         return normed, (normed if _MTP_HIDDEN_POST else residual)
@@ -840,6 +867,7 @@ class GlmMoeDsaModel(BaseOP):
         return self._cos_sin_cache
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        _set_fused_pass(input_ids.shape[0])
         x = self.embed_tokens.forward(input_ids)
         # Fused rope passes the fp32 cache via the `cos` slot with sin=None as the
         # sentinel; the python fallback gets per-forward cos/sin instead.
@@ -847,7 +875,12 @@ class GlmMoeDsaModel(BaseOP):
         residual = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, cos, sin, residual)
-        out, self._last_hidden = self.norm.forward(x, residual)
+        if _fused_pass_active():
+            out, self._last_hidden = _get_fused_ar().ar_add_rmsnorm(
+                x, residual, self.norm.weight, self.norm.eps
+            )
+        else:
+            out, self._last_hidden = self.norm.forward(x, residual)
         if _MTP_HIDDEN_POST:
             self._last_hidden = out
         return out

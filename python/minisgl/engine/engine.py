@@ -132,6 +132,9 @@ class Engine:
                 config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
+            from minisgl.distributed import init_fused_ar
+
+            init_fused_ar(config.tp_info, tp_cpu_group, config.model_config.hidden_size)
         else:
             torch.distributed.init_process_group(
                 backend="nccl",
