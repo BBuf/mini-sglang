@@ -224,8 +224,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     # Speculative decoding (MTP/NextN), flag-compatible with the sglang
-    # GLM-5.2 cookbook: EAGLE topk=1 chain drafts verified as one decode
-    # batch. Defaults mirror the cookbook (5 steps, 6 draft tokens).
+    # GLM-5.2 cookbook (EAGLE topk=1 chain drafts verified as one decode
+    # batch). Defaults are the project setting k=6 (7 draft tokens); the
+    # cookbook values are 5/6 and the aggressive tuning is 7/8.
     parser.add_argument(
         "--speculative-algorithm",
         type=str,
@@ -237,7 +238,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--speculative-num-steps",
         type=int,
-        default=5,
+        default=6,
         help="Number of chained draft steps (k).",
     )
     parser.add_argument(
@@ -249,7 +250,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--speculative-num-draft-tokens",
         type=int,
-        default=6,
+        default=7,
         help="Verify batch size; must equal num-steps + 1.",
     )
 
