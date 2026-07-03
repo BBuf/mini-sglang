@@ -461,10 +461,13 @@ class GlmSparseMoE(BaseOP):
         self.is_fp8 = config.is_fp8
         self.is_fp4 = config.is_fp4 and quantized
         self._fp4 = None  # trtllm-shuffled weights + alphas, built on first forward
+        # default OFF: self-quantizing the (checkpoint-bf16) MTP experts to
+        # W4A4 cuts draft quality hard - measured accept 2.65 vs 4.9-5.0 with
+        # bf16 MTP on the NVFP4 checkpoint (sglang keeps it bf16 too)
         self._mtp_fp4_pending = (
             config.is_fp4
             and not quantized
-            and os.environ.get("MINISGL_MTP_FP4", "1") == "1"
+            and os.environ.get("MINISGL_MTP_FP4", "0") == "1"
         )
         if self.is_fp4:
             self.experts = Fp4Experts(
@@ -566,7 +569,7 @@ class GlmSparseMoE(BaseOP):
         e.down_proj = e.down_proj_scale = None
 
     def _trtllm_fp4_moe(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
-        from flashinfer import trtllm_fp4_block_scale_moe
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
         from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
         if self._fp4 is None:
@@ -574,8 +577,13 @@ class GlmSparseMoE(BaseOP):
         p = self._fp4
         M, H = x.shape
         hb, sb = fp4_quantize(x, p["act_scale"], 16, False, False)
-        out = trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits,
+        # routing OUTSIDE the kernel (same _route as the fp8 path): the
+        # in-kernel routing_method_type=2 top-k weights deviate from the GLM
+        # noaux-tc spec enough to cost ~2 accept (COS 0.9876 vs oracle);
+        # sglang's modelopt path also routes outside for sigmoid models.
+        topk_ids, topk_w = self._route(router_logits)
+        out = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=(topk_ids, topk_w.to(torch.bfloat16)),
             routing_bias=self.gate.e_score_correction_bias,
             hidden_states=hb.reshape(M, H // 2),
             hidden_states_scale=sb.view(torch.float8_e4m3fn).reshape(*sb.shape[:-1], -1),
