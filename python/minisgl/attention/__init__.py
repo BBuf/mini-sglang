@@ -33,6 +33,13 @@ def create_fi_backend(config: ModelConfig):
     return FlashInferBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("mla")
+def create_mla_backend(config: ModelConfig):
+    from .mla import MLABackend
+
+    return MLABackend(config)
+
+
 @SUPPORTED_ATTENTION_BACKENDS.register("fa")
 def create_fa_backend(config: ModelConfig):
     from .fa import FlashAttentionBackend

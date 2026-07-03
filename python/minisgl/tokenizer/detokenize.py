@@ -68,6 +68,16 @@ class DetokenizeManager:
         self.eos_token_id = self.tokenizer.eos_token_id
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # The batched read/surr snapshot below assumes at most one msg per uid;
+        # with several (speculative decoding accepts multiple tokens per step) the
+        # later msgs would re-emit the earlier ones' text. Process sequentially then.
+        uids = [m.uid for m in msgs]
+        if len(set(uids)) != len(uids):
+            out: List[str] = []
+            for m in msgs:
+                out.extend(self.detokenize([m]))
+            return out
+
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

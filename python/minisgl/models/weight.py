@@ -10,7 +10,7 @@ from minisgl.distributed import get_tp_info
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
-_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
+_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj", ".q_b_proj", ".kv_b_proj"]
 _SPLIT_DIM_1 = [".o_proj", ".down_proj"]
 
 # Merge groups: individual projections -> fused projection
@@ -29,10 +29,60 @@ _SLOT_NAMES = {
     ".up_proj": "up",
 }
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
+_LAYER_IDX_PATTERN = re.compile(r"model\.layers\.(\d+)\.")
+_SCALE_SUFFIX = ".weight_scale_inv"
+
+
+def _remap_mtp_key(name: str, num_layers: int) -> str:
+    """The checkpoint stores the MTP / NextN draft layer as model.layers.<num_layers>;
+    remap the pieces mini models onto model.mtp.*. Whatever stays under
+    layers.<num_layers> afterwards (indexer, the tied shared_head.head, embeds) is
+    dropped by _should_skip_key's layer-index threshold."""
+    prefix = f"model.layers.{num_layers}."
+    if not name.startswith(prefix):
+        return name
+    rest = name[len(prefix) :]
+    if ".indexer" in rest:
+        return name
+    if rest.startswith(("enorm", "hnorm", "eh_proj")):
+        return f"model.mtp.{rest}"
+    if rest.startswith("shared_head.norm"):
+        return "model.mtp.shared_head_norm" + rest[len("shared_head.norm") :]
+    if rest.startswith(("self_attn", "mlp", "input_layernorm", "post_attention_layernorm")):
+        return f"model.mtp.decoder.{rest}"
+    return name
+
+
+def _should_skip_key(name: str, num_layers: int) -> bool:
+    """Drop weights not modeled in mini-sglang: the DSA lightning indexer (for
+    seq_len <= index_topk attention is dense, so the indexer is unused) and the
+    MTP / NextN speculative layers appended after the main decoder stack."""
+    if ".indexer" in name or "indexers_proj" in name:
+        return True
+    m = _LAYER_IDX_PATTERN.match(name)
+    if m is not None and int(m.group(1)) >= num_layers:
+        return True
+    return False
+
+
+def _dequant_block_fp8(
+    weight: torch.Tensor, scale_inv: torch.Tensor, block: int = 128
+) -> torch.Tensor:
+    """Dequantize a block-wise FP8 (e4m3) weight to bf16.
+
+    w_bf16[i, j] = w_fp8[i, j] * scale_inv[i // block, j // block]
+    """
+    out_f, in_f = weight.shape
+    s = scale_inv.to(torch.float32)
+    s = s.repeat_interleave(block, dim=0)[:out_f, :]
+    s = s.repeat_interleave(block, dim=1)[:, :in_f]
+    return (weight.to(torch.float32) * s).to(torch.bfloat16)
 
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
     """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
+    if value.ndim < 2:  # per-tensor scalars (e.g. nvfp4 global scales): replicate
+        return value
     if any(key.count(sub) for sub in _SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
         if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
@@ -61,13 +111,25 @@ def _get_merge_info(key: str):
 
 
 def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
-    """Map an expert-scoped checkpoint key to the packed runtime key."""
+    """Map an expert-scoped checkpoint key to the packed runtime key.
+
+    weight:  ...experts.{i}.gate_up_proj.weight            -> ...experts.gate_up_proj
+    fp8 scale: ...experts.{i}.gate_up_proj.weight_scale_inv -> ...experts.gate_up_proj_scale_inv
+    """
     match = _EXPERT_PATTERN.match(key)
     if match is None:
         return None
 
     packed_name = match.group("name")
-    if packed_name.endswith(".weight"):
+    if packed_name.endswith(_SCALE_SUFFIX):
+        packed_name = packed_name[: -len(_SCALE_SUFFIX)] + "_scale_inv"
+    elif packed_name.endswith(".weight_scale_2"):  # nvfp4 (modelopt) global scale
+        packed_name = packed_name.removesuffix(".weight_scale_2") + "_gscale"
+    elif packed_name.endswith(".input_scale"):
+        packed_name = packed_name.removesuffix(".input_scale") + "_in_gscale"
+    elif packed_name.endswith(".weight_scale"):
+        packed_name = packed_name.removesuffix(".weight_scale") + "_scale"
+    elif packed_name.endswith(".weight"):
         packed_name = packed_name.removesuffix(".weight")
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
@@ -83,6 +145,10 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
 
+    # In FP8 mode the model keeps weights in fp8 and consumes the block scales as
+    # separate (sharded/merged/stacked) tensors; otherwise scales are folded in via dequant.
+    is_fp8 = config.is_fp8
+
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
@@ -92,8 +158,28 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
+                stripped = name.removeprefix("language_model.")
+                if config.num_nextn > 0:
+                    stripped = _remap_mtp_key(stripped, config.num_layers)
+                # Only the routed experts stay quantized (FP8 or NVFP4); all other
+                # quantized weights are dequantized to bf16.
+                is_expert = _EXPERT_PATTERN.match(stripped) is not None
+                fp8_keep = is_fp8 and is_expert
+                fp4_keep = getattr(config, "is_fp4", False) and is_expert
+                if name.endswith(_SCALE_SUFFIX):
+                    if not fp8_keep:  # scale consumed by dequant (or bf16 mode) -> drop
+                        continue
+                if stripped.endswith((".k_scale", ".v_scale", ".q_scale")):
+                    continue  # kv-cache quant calibration scales: unused (bf16 KV)
+                if _should_skip_key(stripped, config.num_layers):
+                    continue
                 raw = f.get_tensor(name)
-                name = name.removeprefix("language_model.")
+                if raw.dtype == torch.float8_e4m3fn and name.endswith(".weight") and not fp8_keep:
+                    scale_key = name[: -len(".weight")] + _SCALE_SUFFIX
+                    raw = _dequant_block_fp8(raw, f.get_tensor(scale_key))
+                if fp4_keep and raw.ndim == 0:
+                    raw = raw.reshape(1)  # scalars must be 1-D for merge/stack cat
+                name = stripped
                 tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
                 del raw
 

@@ -30,14 +30,29 @@ def create_kvcache_pool(
     page_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    attention_backend: str = "fi",
 ) -> BaseKVCachePool:
-    from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
+    if model_config.is_mla and attention_backend == "mla":
+        # Absorbed MLA: store the compressed latent (ckv + k_pe) per token per layer,
+        # replicated across TP, instead of per-head K/V.
+        from .mla_pool import MLAKVCache
+
+        return MLAKVCache(
+            kv_lora_rank=model_config.kv_lora_rank,
+            qk_rope_head_dim=model_config.qk_rope_head_dim,
+            num_layers=model_config.num_layers + model_config.num_nextn,
+            num_pages=num_pages,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+        )
+    from .mha_pool import MHAKVCache
 
     return MHAKVCache(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=model_config.num_layers + model_config.num_nextn,
         head_dim=model_config.head_dim,
         device=device,
         dtype=dtype,

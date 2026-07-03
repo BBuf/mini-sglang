@@ -75,6 +75,18 @@ class Scheduler(SchedulerIOMixin):
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
+        # MTP / NextN speculative decoding (bs=1 greedy), opt-in via env
+        import os
+
+        self.spec = None
+        spec_steps = int(os.environ.get("MINISGL_SPEC_STEPS", "0"))
+        if spec_steps > 0 and getattr(self.engine, "num_nextn", 0) > 0:
+            from .spec import SpecManager
+
+            self.spec = SpecManager(self, spec_steps)
+            self.engine.graph_runner.capture_mtp_chain(self.token_pool)
+            logger.info_rank0(f"MTP speculative decoding enabled: k={spec_steps}")
+
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
@@ -110,6 +122,12 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        if self.spec is not None and not self.prefill_manager.runnable:
+            req = self.spec.pick_req()
+            if req is not None:
+                self.spec.run_round(req)
+                return
+
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -119,7 +137,7 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -166,6 +184,9 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
 
+        if self.spec is not None and batch.is_prefill and not new_finished_reqs:
+            self.spec.try_bootstrap(batch)
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -192,6 +213,8 @@ class Scheduler(SchedulerIOMixin):
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
+                if self.spec is not None:
+                    self.spec.drop_req(req_to_free)
                 self._free_req_resources(req_to_free)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
@@ -222,6 +245,10 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+        if batch is not None and self.spec is not None and batch.is_decode:
+            for r in batch.reqs:
+                if r.uid in self.spec.states:
+                    self.spec.drop_req(r)
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:

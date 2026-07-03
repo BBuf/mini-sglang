@@ -144,7 +144,7 @@ def fused_moe_kernel(
     off_experts = tl.load(expert_ids_ptr + pid_m)
     b_ptrs = (
         b_ptr
-        + off_experts * stride_be
+        + off_experts.to(tl.int64) * stride_be
         + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     )
 

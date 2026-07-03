@@ -100,8 +100,10 @@ class LinearOProj(_LinearTPImpl):
         super().__init__(full_isize, full_osize, local_isize, local_osize, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from minisgl.distributed import fused_pass_active
+
         y = F.linear(x, self.weight, self.bias)
-        if self._tp_size > 1:
+        if self._tp_size > 1 and not fused_pass_active():
             y = self._comm.all_reduce(y)
         return y
 
@@ -121,7 +123,9 @@ class LinearRowParallel(_LinearTPImpl):
         super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from minisgl.distributed import fused_pass_active
+
         y = F.linear(x, self.weight, self.bias)
-        if self._tp_size > 1:
+        if self._tp_size > 1 and not fused_pass_active():
             y = self._comm.all_reduce(y)
         return y
