@@ -84,8 +84,15 @@ class MLABackend(BaseAttnBackend):
             self.float_workspace_buffer, backend=_MLA_BACKEND
         )
 
+        # arch-aware default: the trtllm-gen MLA cubin's numerics style on
+        # sm_100 (B200) collapses deep-chain MTP accept (measured 4.37 -> 3.08
+        # at k=6 fp4; same signature as the fp8 B300->B200 drop 5.16 -> 3.31),
+        # while on sm_103 (B300) it is both fast AND accept-friendly. Default
+        # trtllm decode ON only for sm_103; override with MINISGL_TRTLLM_MLA.
+        cc = torch.cuda.get_device_capability(self.device)
+        trtllm_default = "1" if cc == (10, 3) else "0"
         self.use_trtllm_decode = (
-            os.environ.get("MINISGL_TRTLLM_MLA", "1") == "1"
+            os.environ.get("MINISGL_TRTLLM_MLA", trtllm_default) == "1"
             and self.page_size in (32, 64)
             and hasattr(self.kvcache, "combined_cache")
         )
